@@ -1,0 +1,567 @@
+==== golden: alternation, both branches ====
+(seq (alt (m surface "氏") (m surface "さん")))
+---- tokens
+母	名詞,一般,*,*,*	母	ハハ	0	3
+が	助詞,格助詞,一般,*,*	が	ガ	3	6
+氏	名詞,接尾,一般,*,*	氏	シ	6	9
+を	助詞,格助詞,一般,*,*	を	ヲ	9	12
+待つ	動詞,自立,五段・タ行,基本形	待つ	マツ	12	18
+。	記号,句点,*,*,*	。	。	18	21
+彼女	名詞,代名詞,一般,*,*	彼女	カノジョ	21	27
+は	助詞,係助詞,*,*,*	は	ハ	27	30
+さん	名詞,接尾,人名,*,*	さん	サン	30	36
+と	助詞,並立助詞,*,*,*	と	ト	36	39
+言う	動詞,自立,五段・ワ行,基本形	言う	イウ	39	45
+。	記号,句点,*,*,*	。	。	45	48
+---- expected
+2 3 6 9
+8 9 30 36
+
+==== golden: greedy wildcard, backtrack into the verb ====
+(seq (m _ :0-3) (m surface "待つ"))
+---- tokens
+母	名詞,一般,*,*,*	母	ハハ	0	3
+が	助詞,格助詞,一般,*,*	が	ガ	3	6
+氏	名詞,接尾,一般,*,*	氏	シ	6	9
+を	助詞,格助詞,一般,*,*	を	ヲ	9	12
+待つ	動詞,自立,五段・タ行,基本形	待つ	マツ	12	18
+。	記号,句点,*,*,*	。	。	18	21
+彼女	名詞,代名詞,一般,*,*	彼女	カノジョ	21	27
+は	助詞,係助詞,*,*,*	は	ハ	27	30
+さん	名詞,接尾,人名,*,*	さん	サン	30	36
+と	助詞,並立助詞,*,*,*	と	ト	36	39
+言う	動詞,自立,五段・ワ行,基本形	言う	イウ	39	45
+。	記号,句点,*,*,*	。	。	45	48
+---- expected
+1 5 3 18
+
+==== golden: consuming not — negative (next is a particle) ====
+(seq (m surface "氏") (not (m pos ^"助詞,")))
+---- tokens
+母	名詞,一般,*,*,*	母	ハハ	0	3
+が	助詞,格助詞,一般,*,*	が	ガ	3	6
+氏	名詞,接尾,一般,*,*	氏	シ	6	9
+を	助詞,格助詞,一般,*,*	を	ヲ	9	12
+待つ	動詞,自立,五段・タ行,基本形	待つ	マツ	12	18
+。	記号,句点,*,*,*	。	。	18	21
+彼女	名詞,代名詞,一般,*,*	彼女	カノジョ	21	27
+は	助詞,係助詞,*,*,*	は	ハ	27	30
+さん	名詞,接尾,人名,*,*	さん	サン	30	36
+と	助詞,並立助詞,*,*,*	と	ト	36	39
+言う	動詞,自立,五段・ワ行,基本形	言う	イウ	39	45
+。	記号,句点,*,*,*	。	。	45	48
+---- expected
+
+==== golden: consuming not — positive ====
+(seq (m surface "氏") (not (m pos ^"助詞,")))
+---- tokens
+氏	名詞,接尾,一般,*,*	氏	シ	0	3
+待つ	動詞,自立,五段・タ行,基本形	待つ	マツ	3	9
+。	記号,句点,*,*,*	。	。	9	12
+---- expected
+0 2 0 9
+
+==== golden: not! mid-stream reject ====
+(seq (alt (m surface "氏") (m surface "さん")) (not! (m pos ^"助詞,")))
+---- tokens
+母	名詞,一般,*,*,*	母	ハハ	0	3
+が	助詞,格助詞,一般,*,*	が	ガ	3	6
+氏	名詞,接尾,一般,*,*	氏	シ	6	9
+を	助詞,格助詞,一般,*,*	を	ヲ	9	12
+待つ	動詞,自立,五段・タ行,基本形	待つ	マツ	12	18
+。	記号,句点,*,*,*	。	。	18	21
+彼女	名詞,代名詞,一般,*,*	彼女	カノジョ	21	27
+は	助詞,係助詞,*,*,*	は	ハ	27	30
+さん	名詞,接尾,人名,*,*	さん	サン	30	36
+と	助詞,並立助詞,*,*,*	と	ト	36	39
+言う	動詞,自立,五段・ワ行,基本形	言う	イウ	39	45
+。	記号,句点,*,*,*	。	。	45	48
+---- expected
+
+==== golden: not! at end of stream succeeds ====
+(seq (alt (m surface "氏") (m surface "さん")) (not! (m pos ^"助詞,")))
+---- tokens
+彼女	名詞,代名詞,一般,*,*	彼女	カノジョ	0	6
+さん	名詞,接尾,人名,*,*	さん	サン	6	12
+---- expected
+1 2 6 12
+
+==== golden: alternation min obligation (alt …):2- ====
+(seq (alt (m pos ^"名詞,") (m pos ^"動詞,")) :2-)
+---- tokens
+私	名詞,代名詞,一般,*,*	私	ワタシ	0	3
+母	名詞,一般,*,*,*	母	ハハ	3	6
+待つ	動詞,自立,五段・タ行,基本形	待つ	マツ	6	12
+。	記号,句点,*,*,*	。	。	12	15
+---- expected
+0 3 0 12
+
+==== golden: $ at a segment boundary ====
+(seq $ (m surface "待つ"))
+---- tokens
+私	名詞,代名詞,一般,*,*	私	ワタシ	0	3
+待つ	動詞,自立,五段・タ行,基本形	待つ	マツ	3	9
+。	記号,句点,*,*,*	。	。	9	12
+---- segments
+sentence	0	9
+---- expected
+1 2 3 9
+
+==== golden: $ without segments ====
+(seq $ (m surface "待つ"))
+---- tokens
+私	名詞,代名詞,一般,*,*	私	ワタシ	0	3
+待つ	動詞,自立,五段・タ行,基本形	待つ	マツ	3	9
+。	記号,句点,*,*,*	。	。	9	12
+---- expected
+
+==== golden: fuzzy with kana fold ====
+(seq (m surface (fuzzy "わたし" :1)))
+---- tokens
+あたし	名詞,代名詞,一般,*,*	あたし	アタシ	0	9
+。	記号,句点,*,*,*	。	。	9	12
+---- expected
+0 1 0 9
+
+==== golden: ^ at stream start ====
+(seq ^ (m pos ^"名詞,"))
+---- tokens
+私	名詞,代名詞,一般,*,*	私	ワタシ	0	3
+母	名詞,一般,*,*,*	母	ハハ	3	6
+待つ	動詞,自立,五段・タ行,基本形	待つ	マツ	6	12
+。	記号,句点,*,*,*	。	。	12	15
+---- expected
+0 1 0 3
+
+==== golden: capture spans a quantified run ====
+(seq (m _ :0-3) @g (m surface "待つ"))
+---- tokens
+母	名詞,一般,*,*,*	母	ハハ	0	3
+が	助詞,格助詞,一般,*,*	が	ガ	3	6
+氏	名詞,接尾,一般,*,*	氏	シ	6	9
+を	助詞,格助詞,一般,*,*	を	ヲ	9	12
+待つ	動詞,自立,五段・タ行,基本形	待つ	マツ	12	18
+。	記号,句点,*,*,*	。	。	18	21
+彼女	名詞,代名詞,一般,*,*	彼女	カノジョ	21	27
+は	助詞,係助詞,*,*,*	は	ハ	27	30
+さん	名詞,接尾,人名,*,*	さん	サン	30	36
+と	助詞,並立助詞,*,*,*	と	ト	36	39
+言う	動詞,自立,五段・ワ行,基本形	言う	イウ	39	45
+。	記号,句点,*,*,*	。	。	45	48
+---- expected
+1 5 3 18 @g 1 4 3 12
+
+==== golden: greedy backtrack shrinks the capture end ====
+(seq (m _ :1-3) @g (m surface "氏"))
+---- tokens
+母	名詞,一般,*,*,*	母	ハハ	0	3
+が	助詞,格助詞,一般,*,*	が	ガ	3	6
+氏	名詞,接尾,一般,*,*	氏	シ	6	9
+を	助詞,格助詞,一般,*,*	を	ヲ	9	12
+待つ	動詞,自立,五段・タ行,基本形	待つ	マツ	12	18
+。	記号,句点,*,*,*	。	。	18	21
+彼女	名詞,代名詞,一般,*,*	彼女	カノジョ	21	27
+は	助詞,係助詞,*,*,*	は	ハ	27	30
+さん	名詞,接尾,人名,*,*	さん	サン	30	36
+と	助詞,並立助詞,*,*,*	と	ト	36	39
+言う	動詞,自立,五段・ワ行,基本形	言う	イウ	39	45
+。	記号,句点,*,*,*	。	。	45	48
+---- expected
+0 3 0 9 @g 0 2 0 6
+
+==== golden: the accepted branch sizes the binding ====
+(seq ^ (alt (m _ :2-2) (m _ :1-1)) @a (m surface "を"))
+---- tokens
+母	名詞,一般,*,*,*	母	ハハ	0	3
+が	助詞,格助詞,一般,*,*	が	ガ	3	6
+氏	名詞,接尾,一般,*,*	氏	シ	6	9
+を	助詞,格助詞,一般,*,*	を	ヲ	9	12
+待つ	動詞,自立,五段・タ行,基本形	待つ	マツ	12	18
+。	記号,句点,*,*,*	。	。	18	21
+彼女	名詞,代名詞,一般,*,*	彼女	カノジョ	21	27
+は	助詞,係助詞,*,*,*	は	ハ	27	30
+さん	名詞,接尾,人名,*,*	さん	サン	30	36
+と	助詞,並立助詞,*,*,*	と	ト	36	39
+言う	動詞,自立,五段・ワ行,基本形	言う	イウ	39	45
+。	記号,句点,*,*,*	。	。	45	48
+---- segments
+sentence	6	48
+---- expected
+2 4 6 12 @a 2 3 6 9
+
+==== golden: capture on the alternation compound ====
+(seq (alt (m surface "氏") (m surface "さん")) @a)
+---- tokens
+母	名詞,一般,*,*,*	母	ハハ	0	3
+が	助詞,格助詞,一般,*,*	が	ガ	3	6
+氏	名詞,接尾,一般,*,*	氏	シ	6	9
+を	助詞,格助詞,一般,*,*	を	ヲ	9	12
+待つ	動詞,自立,五段・タ行,基本形	待つ	マツ	12	18
+。	記号,句点,*,*,*	。	。	18	21
+彼女	名詞,代名詞,一般,*,*	彼女	カノジョ	21	27
+は	助詞,係助詞,*,*,*	は	ハ	27	30
+さん	名詞,接尾,人名,*,*	さん	サン	30	36
+と	助詞,並立助詞,*,*,*	と	ト	36	39
+言う	動詞,自立,五段・ワ行,基本形	言う	イウ	39	45
+。	記号,句点,*,*,*	。	。	45	48
+---- expected
+2 3 6 9 @a 2 3 6 9
+8 9 30 36 @a 8 9 30 36
+
+==== golden: one name at two compounds, match order ====
+(seq (m surface "母") @w (m surface "が") @w)
+---- tokens
+母	名詞,一般,*,*,*	母	ハハ	0	3
+が	助詞,格助詞,一般,*,*	が	ガ	3	6
+氏	名詞,接尾,一般,*,*	氏	シ	6	9
+を	助詞,格助詞,一般,*,*	を	ヲ	9	12
+待つ	動詞,自立,五段・タ行,基本形	待つ	マツ	12	18
+。	記号,句点,*,*,*	。	。	18	21
+彼女	名詞,代名詞,一般,*,*	彼女	カノジョ	21	27
+は	助詞,係助詞,*,*,*	は	ハ	27	30
+さん	名詞,接尾,人名,*,*	さん	サン	30	36
+と	助詞,並立助詞,*,*,*	と	ト	36	39
+言う	動詞,自立,五段・ワ行,基本形	言う	イウ	39	45
+。	記号,句点,*,*,*	。	。	45	48
+---- expected
+0 2 0 6 @w 0 1 0 3 @w 1 2 3 6
+
+==== golden: capture on consuming negation ====
+(seq (m surface "氏") @h (not (m pos ^"助詞,")) @n)
+---- tokens
+氏	名詞,接尾,一般,*,*	氏	シ	0	3
+待つ	動詞,自立,五段・タ行,基本形	待つ	マツ	3	9
+。	記号,句点,*,*,*	。	。	9	12
+---- expected
+0 2 0 9 @h 0 1 0 3 @n 1 2 3 9
+
+==== golden: zero-run capture binds the empty span ====
+(seq (m surface "母") @m (m _ :0-2) @gap (m surface "が"))
+---- tokens
+母	名詞,一般,*,*,*	母	ハハ	0	3
+が	助詞,格助詞,一般,*,*	が	ガ	3	6
+氏	名詞,接尾,一般,*,*	氏	シ	6	9
+を	助詞,格助詞,一般,*,*	を	ヲ	9	12
+待つ	動詞,自立,五段・タ行,基本形	待つ	マツ	12	18
+。	記号,句点,*,*,*	。	。	18	21
+彼女	名詞,代名詞,一般,*,*	彼女	カノジョ	21	27
+は	助詞,係助詞,*,*,*	は	ハ	27	30
+さん	名詞,接尾,人名,*,*	さん	サン	30	36
+と	助詞,並立助詞,*,*,*	と	ト	36	39
+言う	動詞,自立,五段・ワ行,基本形	言う	イウ	39	45
+。	記号,句点,*,*,*	。	。	45	48
+---- expected
+0 2 0 6 @m 0 1 0 3 @gap 1 1 3 3
+
+==== predicate: suffix ====
+(seq (m surface $"ー"))
+---- tokens
+バー	名詞,一般,*,*,*	バー	バー	0	6
+です	助動詞,*,*,*,*	です	デス	6	12
+---- expected
+0 1 0 6
+
+==== predicate: all-eq (any …) is one set ====
+(seq (m surface (any "母" "氏")))
+---- tokens
+母	名詞,一般,*,*,*	母	ハハ	0	3
+が	助詞,格助詞,一般,*,*	が	ガ	3	6
+氏	名詞,接尾,一般,*,*	氏	シ	6	9
+を	助詞,格助詞,一般,*,*	を	ヲ	9	12
+---- expected
+0 1 0 3
+2 3 6 9
+
+==== predicate: mixed (any …) compiles to alternation ====
+(seq (m pos (any ^"名詞," ^"動詞,")))
+---- tokens
+私	名詞,代名詞,一般,*,*	私	ワタシ	0	3
+母	名詞,一般,*,*,*	母	ハハ	3	6
+待つ	動詞,自立,五段・タ行,基本形	待つ	マツ	6	12
+。	記号,句点,*,*,*	。	。	12	15
+---- expected
+0 1 0 3
+1 2 3 6
+2 3 6 12
+
+==== predicate: unknown boolean and its negation ====
+(seq (m unknown))
+---- tokens
+観た	動詞,自立,一段,連用形	観る	ミタ	0	6
+まちご	名詞,固有名詞,一般,*,*	まちご	マチゴ	6	12	1
+---- expected
+1 2 6 12
+
+==== predicate: negated unknown ====
+(seq (not (m unknown)))
+---- tokens
+観た	動詞,自立,一段,連用形	観る	ミタ	0	6
+まちご	名詞,固有名詞,一般,*,*	まちご	マチゴ	6	12	1
+---- expected
+0 1 0 6
+
+==== predicate: fuzzy width fold (fullwidth ASCII) ====
+(seq (m surface (fuzzy "ABC" :0)))
+---- tokens
+ＡＢＣ	名詞,一般,*,*,*	ＡＢＣ	エービーシー	0	9
+です	助動詞,*,*,*,*	です	デス	9	15
+---- expected
+0 1 0 9
+
+==== predicate: fuzzy transposition within :1 ====
+(seq (m surface (fuzzy "システム" :1)))
+---- tokens
+システモ	名詞,一般,*,*,*	システム	システム	0	12
+---- expected
+0 1 0 12
+
+==== predicate: fuzzy distance boundary rejects :1 ====
+(seq (m surface (fuzzy "システム" :1)))
+---- tokens
+シスデモム	名詞,一般,*,*,*	シスデモム	シスデモム	0	12
+---- expected
+
+==== predicate: fuzzy distance boundary accepts :2 ====
+(seq (m surface (fuzzy "システム" :2)))
+---- tokens
+シスデモム	名詞,一般,*,*,*	シスデモム	シスデモム	0	12
+---- expected
+0 1 0 12
+
+==== predicate: two fields AND on one step ====
+(seq (m lemma "待つ" pos ^"動詞,"))
+---- tokens
+待つ	動詞,自立,五段・タ行,基本形	待つ	マツ	0	6
+待つ	名詞,一般,*,*,*	待つ	マツ	6	12
+---- expected
+0 1 0 6
+
+==== synonym: ~ expands through the registered group ====
+(seq (m lemma ~"見る"))
+---- options
+group 見る
+---- tokens
+観た	動詞,自立,一段,連用形	観る	ミタ	0	6
+未知語	名詞,固有名詞,一般,*,*	未知語	ミチゴ	6	12	1
+---- expected
+0 1 0 6
+
+==== custom: % resolves through the registered proc ====
+(seq (m reading %"sys"))
+---- options
+custom sys
+---- tokens
+システム	名詞,一般,*,*,*	システム	システム	0	12
+まちご	名詞,固有名詞,一般,*,*	まちご	マチゴ	12	18	1
+---- expected
+0 1 0 12
+
+==== kwic: clamp at segment edges, empty context at stream start ====
+(seq (m surface "夜"))
+---- tokens
+夜	名詞,一般,*,*,*	夜	ヨル	0	3
+が	助詞,格助詞,一般,*,*	が	ガ	3	6
+更ける	動詞,自立,一段,基本形	更ける	フケル	6	15
+。	記号,句点,*,*,*	。	。	15	18
+底	名詞,一般,*,*,*	底	ソコ	18	21
+に	助詞,格助詞,一般,*,*	に	ニ	21	24
+夜	名詞,一般,*,*,*	夜	ヨル	24	27
+が	助詞,格助詞,一般,*,*	が	ガ	27	30
+鳴く	動詞,自立,五段・カ行,基本形	鳴く	ナク	30	36
+。	記号,句点,*,*,*	。	。	36	39
+底	名詞,一般,*,*,*	底	ソコ	39	42
+。	記号,句点,*,*,*	。	。	42	45
+---- segments
+chapter 0 18
+chapter 18 45
+---- expected
+0 1 0 3
+6 7 24 27
+---- kwic 2 2 -1
+0 0 0 3 3 15
+18 24 24 27 27 36
+
+==== kwic: capture-centered row, context clamps around the match ====
+(seq (m surface "は") (m surface "静か") @adv (m surface "に"))
+---- tokens
+彼女	名詞,代名詞,一般,*,*	彼女	カノジョ	0	6
+は	助詞,係助詞,*,*,*	は	ハ	6	9
+静か	形状詞,*,*,*,*	静か	シズカ	9	15
+に	助詞,格助詞,一般,*,*	に	ニ	15	18
+微笑ん	動詞,自立,五段・マ行,連用形仮定縮約1	微笑む	ホホエン	18	27
+だ	助動詞,特殊・ダ,基本形	だ	ダ	27	30
+。	記号,句点,*,*,*	。	。	30	33
+---- expected
+1 4 6 18 @adv 2 3 9 15
+---- kwic 1 1 0
+6 9 9 15 15 18
+
+==== kwic: sort keys reorder the rows ====
+(seq (m surface "夜"))
+---- tokens
+夜	名詞,一般,*,*,*	夜	ヨル	0	3
+が	助詞,格助詞,一般,*,*	が	ガ	3	6
+更ける	動詞,自立,一段,基本形	更ける	フケル	6	15
+夜	名詞,一般,*,*,*	夜	ヨル	15	18
+の	助詞,連体化,*,*,*	の	ノ	18	21
+底	名詞,一般,*,*,*	底	ソコ	21	24
+に	助詞,格助詞,一般,*,*	に	ニ	24	27
+夜	名詞,一般,*,*,*	夜	ヨル	27	30
+鳴く	動詞,自立,五段・カ行,基本形	鳴く	ナク	30	36
+---- expected
+0 1 0 3
+3 4 15 18
+7 8 27 30
+---- kwic 2 2 -1
+0 0 0 3 3 15
+3 15 15 18 18 24
+21 27 27 30 30 36
+---- kwic-sort Left_1
+0 2 1
+---- kwic-sort Left_2
+0 1 2
+---- kwic-sort Right_1
+0 1 2
+---- kwic-sort Right_2
+2 1 0
+---- kwic-sort Surface
+0 1 2
+---- kwic-sort Position
+0 1 2
+
+==== compound: merged fields, saturating-eligible cost sum, pass-through ====
+(seq (m surface "硝子") (m surface "の") (m surface "扉"))
+---- text
+硝子の扉が開いた。
+---- tokens
+硝子	名詞,一般,*,*,*	硝子	ガラス	0	6	-	1000
+の	助詞,連体化,*,*,*	の	ノ	6	9	-	4000
+扉	名詞,一般,*,*,*	扉	トビラ	9	12	-	1200
+が	助詞,格助詞,一般,*,*	が	ガ	12	15	-	3900
+開い	動詞,自立,カ行五段,連用形	開く	ヒライ	15	21	-	6000
+た	助動詞,特殊・タ,基本形	た	タ	21	24	-	5000
+。	記号,句点,*,*,*	。	。	24	27	-	100
+---- expected
+0 3 0 12
+---- compound
+硝子の扉	名詞,一般,*,*,*	硝子の扉	ガラス	0	12	idless	6200
+が	助詞,格助詞,一般,*,*	が	ガ	12	15	-	3900
+開い	動詞,自立,カ行五段,連用形	開く	ヒライ	15	21	-	6000
+た	助動詞,特殊・タ,基本形	た	タ	21	24	-	5000
+。	記号,句点,*,*,*	。	。	24	27	-	100
+
+==== compound: inter-token bytes land inside the merged surface ====
+(seq (m surface "青") (m surface "空"))
+---- text
+青 空 の 日
+---- tokens
+青	名詞,一般,*,*,*	青	アオ	0	3
+空	名詞,一般,*,*,*	空	ソラ	4	7
+の	助詞,連体化,*,*,*	の	ノ	8	11
+日	名詞,一般,*,*,*	日	ニチ	12	15
+---- expected
+0 2 0 7
+---- compound
+青 空	名詞,一般,*,*,*	青 空	アオ	0	7	idless
+の	助詞,連体化,*,*,*	の	ノ	8	11
+日	名詞,一般,*,*,*	日	ニチ	12	15
+
+==== parse error: bounded alt quantifier ====
+(seq (alt (m surface "氏") (m surface "さん")) :0-16)
+---- error Bad_Quantifier
+
+==== parse error: alt :3 has max 3 ====
+(seq (alt (m surface "氏") (m surface "さん")) :3)
+---- error Bad_Quantifier
+
+==== parse error: alt branch with min 0 ====
+(seq (alt (m _ :0-1) (m _)) :*)
+---- error Bad_Quantifier
+
+==== parse error: mixed-any under a bounded quant ====
+(seq (m pos (any ^"名詞," ^"動詞,") :0-2))
+---- error Bad_Quantifier
+
+==== parse error: fuzzy distance past 3 ====
+(seq (m lemma (fuzzy "少ない" :4)))
+---- error Bad_Quantifier
+
+==== parse error: bounded quant max past 64 ====
+(seq (m _ :0-100000))
+---- error Bad_Quantifier
+
+==== parse error: quant max below min ====
+(seq (m _ :5-2))
+---- error Bad_Quantifier
+
+==== parse error: _ as a value ====
+(seq (m lemma _))
+---- error Bad_Value
+
+==== parse error: unknown field ====
+(seq (m nosuch "x"))
+---- error Unknown_Field
+
+==== parse error: ~ with no groups registered ====
+(seq (m lemma ~"見る"))
+---- error No_Group
+
+==== parse error: % with no proc registered ====
+(seq (m reading %"nope"))
+---- error No_Custom
+
+==== parse error: same field twice ====
+(seq (m lemma "走る" lemma "走る"))
+---- error Bad_Syntax
+
+==== parse error: quant on not! ====
+(seq (m surface "氏") (not! (m pos ^"助詞,")) :?)
+---- error Bad_Syntax
+
+==== parse error: capture on not! ====
+(seq (m surface "氏") (not! (m pos ^"助詞,")) @a)
+---- error Bad_Syntax
+
+==== parse error: capture on nothing ====
+(seq @a (m _))
+---- error Bad_Syntax
+
+==== parse error: capture inside alt ====
+(seq (alt (m _) @a (m _)))
+---- error Bad_Syntax
+
+==== parse error: $ before ^ ====
+(seq $ ^ (m _))
+---- error Bad_Syntax
+
+==== parse error: empty seq ====
+(seq)
+---- error Bad_Syntax
+
+==== parse error: truncated source ====
+(seq (m surface "氏")
+---- error Bad_Syntax
+
+==== parse error: unterminated string ====
+(seq (m surface "未閉))
+---- error Bad_Syntax
+
+==== parse error: trailing junk ====
+(seq (m _)) junk
+---- error Bad_Syntax
+
+==== parse error: second quant site ====
+(seq (m _ :0-2) :0-2)
+---- error Bad_Syntax
+
+==== parse error: nested alt branch ====
+(seq (alt (alt (m _) (m _)) (m _)))
+---- error Bad_Syntax
+
+==== parse error: not of alt ====
+(seq (not (alt (m _) (m _))))
+---- error Bad_Syntax
+
+==== parse error: quant not last inside m ====
+(seq (m :0-2 _))
+---- error Bad_Syntax

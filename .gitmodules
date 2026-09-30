@@ -1,0 +1,3 @@
+[submodule "vendor/moli"]
+	path = vendor/moli
+	url = https://github.com/tagumasa/moli

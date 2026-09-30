@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  odin:
+    name: Odin (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # The nightly distribution replaces assets under the same date key,
+      # so consecutive runs can silently test different compilers. The
+      # dev-YYYY-MM GitHub releases are frozen assets; dev-2026-09 is
+      # exactly dev-2026-09-nightly:a2fb372, the build this repository
+      # is developed against. Re-pin deliberately when bumping the
+      # toolchain (and re-baseline docs/benchmarks.md with it).
+      - name: Set up Odin (dev-2026-09)
+        uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release: dev-2026-09
+
+      # Hard gate: anything other than the pinned toolchain fails the job
+      # here. The setup action's failure modes (missing token, missing
+      # asset) silently fall back to a git-based build of a different
+      # revision, which reintroduces exactly the moving-compiler problem
+      # the pin exists to prevent — a fallback must be visible.
+      - name: Assert Odin toolchain (dev-2026-09-nightly:a2fb372)
+        shell: bash
+        run: |
+          odin version
+          odin version | grep -q 'dev-2026-09-nightly:a2fb372'
+
+      # Odin invokes `clang` from PATH for every link; on darwin which
+      # clang answers is environment state we do not control. Odin
+      # honors ODIN_CLANG_PATH; pin it to the Apple toolchain's own
+      # clang and log the toolchain facts for diagnosis.
+      - name: Pin Odin's linker to the Apple toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          echo "clang on PATH: $(command -v clang)"
+          clang --version
+          echo "ODIN_CLANG_PATH=$(xcrun --find clang)" >> "$GITHUB_ENV"
+
+      # `just` is not preinstalled on any GitHub-hosted runner image.
+      - name: Set up just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # The library gates are core-only: no C toolchain dependencies,
+      # no submodules — the Odin compiler and just are the whole setup.
+      - name: Check (vet + strict style)
+        run: just check
+
+      - name: Test
+        run: just test
+
+      # The seam gates exercise the vendored moli submodule (pure Odin,
+      # committed fixtures only — no dictionary data needed).
+      - name: Initialize the moli submodule
+        run: git submodule update --init
+
+      - name: Check adapter
+        run: just check-adapter
+
+      - name: Test adapter
+        run: just test-adapter
+
+      - name: Check CLI
+        run: just check-cli

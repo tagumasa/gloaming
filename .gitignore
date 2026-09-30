@@ -1,0 +1,22 @@
+tmp/
+
+# Local corpora — never committed (see corpus/README.md)
+corpus/*
+!corpus/README.md
+
+# Editor/agent session artifacts
+.aubade/
+
+# Odin test binary (odin test tests drops it in the repo root)
+/tests.bin
+
+# CLI host binary (just cli builds it in the repo root)
+/gloaming
+
+# Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.a
