@@ -1501,6 +1501,20 @@ match_run :: proc(c: ^Match_Cursor, steps0: []Query_Step, pos0: int,
 				kind = .Act_Cont
 				continue
 			}
+			if i == len(steps) - 1 {
+				// the tail step suspends nothing: its Seq cont could only
+				// resume into the i == len hop (success goes straight to
+				// up), and its Seq_Wait had no cont of its own to truncate
+				// — the Fresh_Wait below rolls the attempt back alone.
+				// Every legal pattern owes through this path with cont = up
+				// (an AltLoop never sits directly under a multi-step seq:
+				// alt branches are one m per branch), so the memo's owed
+				// key is the zero it always was here.
+				s = &steps[i]
+				cont = up
+				kind = .Act_Fresh
+				continue
+			}
 			k := len(c.conts)
 			append(&c.conts, Cont{kind = .Seq, steps = steps, idx = i + 1, up = up})
 			append(&c.frames, Frame{kind = .Seq_Wait, k = k})
