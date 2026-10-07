@@ -309,15 +309,17 @@ huffman_compute_lengths :: proc(freqs: []int, max_symbol: int, max_bits: int) ->
 
 // --- LZ77 (the chain arrays are ~512 KiB — heap, never stack) ---
 
+// Candidates live by absolute position: head/prev hold window-index
+// positions whose distance to lz.pos is the match distance, and the
+// bytes themselves are validated straight against src — a separate
+// circular window copy of src would be write-only, so there is none.
 LZ77_State :: struct {
-	window: [dynamic]u8,
-	pos:    int,
-	head:   [DEFLATE_HASH_SIZE]int,
-	prev:   [DEFLATE_WINDOW_SIZE]int,
+	pos:  int,
+	head: [DEFLATE_HASH_SIZE]int,
+	prev: [DEFLATE_WINDOW_SIZE]int,
 }
 
 lz77_init :: proc(lz: ^LZ77_State, a := context.allocator) {
-	lz.window = make([dynamic]u8, DEFLATE_WINDOW_SIZE, a)
 	lz.pos = 0
 	for i in 0..<DEFLATE_HASH_SIZE { lz.head[i] = -1 }
 	for i in 0..<DEFLATE_WINDOW_SIZE { lz.prev[i] = -1 }
@@ -329,11 +331,8 @@ lz77_hash3 :: proc(a, b, c: u8) -> int {
 
 lz77_insert :: proc(lz: ^LZ77_State, src: []u8, src_pos: int) {
 	if src_pos + 2 >= len(src) { return }
-	p := lz.pos & (DEFLATE_WINDOW_SIZE - 1)
-	lz.window[p] = src[src_pos]
-	if src_pos + 1 < len(src) { lz.window[(p + 1) & (DEFLATE_WINDOW_SIZE - 1)] = src[src_pos + 1] }
-	if src_pos + 2 < len(src) { lz.window[(p + 2) & (DEFLATE_WINDOW_SIZE - 1)] = src[src_pos + 2] }
 	h := lz77_hash3(src[src_pos], src[src_pos + 1], src[src_pos + 2])
+	p := lz.pos & (DEFLATE_WINDOW_SIZE - 1)
 	lz.prev[p] = lz.head[h]
 	lz.head[h] = p
 	lz.pos += 1
@@ -446,20 +445,23 @@ encode_code_lengths :: proc(lengths: []u8, a := context.allocator) -> ([]CL_Run,
 // --- Main compress entry point ---
 // Compresses src into dst as a raw DEFLATE stream (no zlib/gzip wrapper).
 
-LZ77_Decision :: struct {
-	is_match:   bool,
-	lit:        u16, // literal byte (if !is_match) or length code (if is_match)
-	dist:       u16, // distance code (only meaningful if is_match)
-	extra_len:  u16, // extra bits for length
-	extra_dist: u16, // extra bits for distance
-}
+/*
+One u32 per LZ77 decision: bit 0 set = match, bits 1..9 the match
+length or the literal byte, bits 10..25 the match distance. Lengths
+cap at 258 and distances at the 32-KiB window, so both fit; the emit
+pass re-derives codes and extra bits from the LUTs, making the packed
+word the whole record — 4 B per input byte of scratch.
+*/
+dec_match_flag :: u32(1)
+dec_len_shift :: 1
+dec_dist_shift :: 10
 
 /*
 deflate_compress emits one dynamic-Huffman block covering all of src,
 appending the raw stream to `out` (which must already have its allocator
 — reserve roughly half the input plus a kilobyte to skip growth).
 Scratch lives on `a` (the LZ77 state alone is ~512 KiB, decisions
-another ~8 B per input byte) — pass an arena. Always compresses;
+another ~4 B per input byte) — pass an arena. Always compresses;
 decompression is core:compress/zlib's (raw mode).
 
 `max_chain` is the effort dial: how many hash-chain candidates each
@@ -486,7 +488,7 @@ deflate_compress :: proc(src: []u8, out: ^[dynamic]u8, a := context.allocator,
 		lit_lengths  := huffman_compute_lengths(lit_freq[:], DEFLATE_MAX_LIT, 15)
 		dist_lengths := huffman_compute_lengths(dist_freq[:], DEFLATE_MAX_DIST_SYM, 15)
 
-		_emit_dynamic_header_and_block(&w, lit_lengths[:], dist_lengths[:], nil, a)
+		_emit_dynamic_header_and_block(&w, lit_lengths[:], dist_lengths[:], nil, nil, nil, a)
 		deflate_flush(&w)
 		return true
 	}
@@ -494,10 +496,9 @@ deflate_compress :: proc(src: []u8, out: ^[dynamic]u8, a := context.allocator,
 	lz := new(LZ77_State, a)
 	defer free(lz, a)
 	lz77_init(lz, a)
-	defer delete(lz.window)
 
 	// Single pass: scan, find matches, record decisions
-	decisions := make([dynamic]LZ77_Decision, 0, len(src), a)
+	decisions := make([dynamic]u32, 0, len(src), a)
 	defer delete(decisions)
 
 	len_lut: [259]u16
@@ -517,16 +518,24 @@ deflate_compress :: proc(src: []u8, out: ^[dynamic]u8, a := context.allocator,
 		if ml >= DEFLATE_MIN_MATCH {
 			lc := int(len_lut[ml])
 			dc := int(dist_lut[d])
-			lv := ml - int(LENGTH_BASE[lc - 257])
-			dv := d - int(DIST_BASE[dc])
 			lit_freq[lc] += 1
 			dist_freq[dc] += 1
-			append(&decisions, LZ77_Decision{true, u16(lc), u16(dc), u16(lv), u16(dv)})
-			for i in 1..<ml { lz77_insert(lz, src, pos + i) }
+			append(&decisions, dec_match_flag | (u32(ml) << dec_len_shift) | (u32(d) << dec_dist_shift))
+			// Match interiors are mostly never inserted: the hash chains
+			// carry match starts plus one anchor at pos+1 (the overlapping
+			// match finder), and lz.pos advances through the whole interior
+			// — window indices stay 1:1 with src positions, only chain
+			// membership is omitted. This is a recorded output policy: the
+			// emitted bytes differ from an all-insert writer (the stream
+			// stays valid raw DEFLATE and round-trips byte-exact), trading
+			// a measured slice of ratio for the insert work every consumed
+			// position used to pay.
+			lz77_insert(lz, src, pos + 1)
+			lz.pos += ml - 2
 			pos += ml
 		} else {
 			lit_freq[src[pos]] += 1
-			append(&decisions, LZ77_Decision{false, u16(src[pos]), 0, 0, 0})
+			append(&decisions, u32(src[pos]) << dec_len_shift)
 			pos += 1
 		}
 	}
@@ -536,13 +545,14 @@ deflate_compress :: proc(src: []u8, out: ^[dynamic]u8, a := context.allocator,
 	lit_lengths  := huffman_compute_lengths(lit_freq[:], DEFLATE_MAX_LIT, 15)
 	dist_lengths := huffman_compute_lengths(dist_freq[:], DEFLATE_MAX_DIST_SYM, 15)
 
-	_emit_dynamic_header_and_block(&w, lit_lengths[:], dist_lengths[:], decisions[:], a)
+	_emit_dynamic_header_and_block(&w, lit_lengths[:], dist_lengths[:], decisions[:], &len_lut, dist_lut, a)
 	deflate_flush(&w)
 	return true
 }
 
 _emit_dynamic_header_and_block :: proc(w: ^Deflate_Writer, lit_lengths, dist_lengths: []u8,
-                                       decisions: []LZ77_Decision, a: mem.Allocator) {
+                                       decisions: []u32, len_lut: ^[259]u16,
+                                       dist_lut: []u8, a: mem.Allocator) {
 	nlit := len(lit_lengths)
 	for nlit > 257 && lit_lengths[nlit - 1] == 0 { nlit -= 1 }
 	ndist := len(dist_lengths)
@@ -595,17 +605,23 @@ _emit_dynamic_header_and_block :: proc(w: ^Deflate_Writer, lit_lengths, dist_len
 	huffman_build(&dist_tbl, dist_lengths[:])
 
 	for d in decisions {
-		if d.is_match {
-			deflate_write_bits(w, u32(lit_tbl.codes[d.lit]), int(lit_tbl.bits[d.lit]))
-			if d.lit >= 265 && d.lit <= 284 {
-				deflate_write_bits(w, u32(d.extra_len), int(LENGTH_EXTRA[d.lit - 257]))
+		if d & dec_match_flag != 0 {
+			ml := int(d >> dec_len_shift) & 0x1FF
+			dist := int(d >> dec_dist_shift)
+			lc := int(len_lut[ml])
+			dc := int(dist_lut[dist])
+			deflate_write_bits(w, u32(lit_tbl.codes[lc]), int(lit_tbl.bits[lc]))
+			if lc >= 265 && lc <= 284 {
+				deflate_write_bits(w, u32(ml - int(LENGTH_BASE[lc - 257])),
+				                   int(LENGTH_EXTRA[lc - 257]))
 			}
-			deflate_write_bits(w, u32(dist_tbl.codes[d.dist]), int(dist_tbl.bits[d.dist]))
-			if d.dist >= 4 {
-				deflate_write_bits(w, u32(d.extra_dist), int(DIST_EXTRA[d.dist]))
+			deflate_write_bits(w, u32(dist_tbl.codes[dc]), int(dist_tbl.bits[dc]))
+			if dc >= 4 {
+				deflate_write_bits(w, u32(dist - int(DIST_BASE[dc])), int(DIST_EXTRA[dc]))
 			}
 		} else {
-			deflate_write_bits(w, u32(lit_tbl.codes[d.lit]), int(lit_tbl.bits[d.lit]))
+			b := int(d >> dec_len_shift)
+			deflate_write_bits(w, u32(lit_tbl.codes[b]), int(lit_tbl.bits[b]))
 		}
 	}
 

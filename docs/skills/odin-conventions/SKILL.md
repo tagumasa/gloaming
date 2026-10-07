@@ -24,6 +24,9 @@ category carries a rule:
   snake_case** (`tokenize_text`, `entry_count`, `cursor_pos`).
 - **Package names are lowercase single words** (`moli`, `gloaming`,
   `jsonrpc`).
+- `matrix` and `distinct` are keywords — never identifiers; a
+  distinct-type declaration (`Doc_Id :: distinct u32`) is the
+  keyword's own use.
 
 Role overlays — applied on top of the base layer:
 

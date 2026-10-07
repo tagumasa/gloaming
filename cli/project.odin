@@ -26,7 +26,7 @@ import gl "gloaming:gloaming"
 import glexport "gloaming:glexport"
 
 MANIFEST_NAME :: "manifest.json"
-CLI_VERSION    :: "0.1.0"
+CLI_VERSION    :: "0.1.1"
 
 Lang_Kind :: enum {
 	Moli,    // analyzer languages: ja, zh-*, de

@@ -27,7 +27,7 @@ What actually happened.
 ## Environment
 
 - OS: [e.g., Linux, macOS, Windows]
-- Odin version: [e.g., dev-2026-09-nightly:a2fb372]
+- Odin version: [e.g., dev-2026-10-nightly:84bc3fc]
 - gloaming version: [e.g., v0.1.0, or a commit hash]
 - Surface: [library embedding, or the CLI]
 

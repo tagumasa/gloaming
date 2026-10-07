@@ -176,7 +176,7 @@ those recipes skip with a note when their inputs are absent.
 
 ## Requirements
 
-- The Odin compiler, nightly `dev-2026-09-nightly:a2fb372` (gates are
+- The Odin compiler, nightly `dev-2026-10-nightly:84bc3fc` (gates are
   re-run and the pin re-baselined after toolchain updates)
 - `just` (any recent version)
 - The vendored moli submodule, initialized, for the adapter/CLI/bench

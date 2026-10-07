@@ -335,15 +335,16 @@ payload_compress wraps a GLB1 blob for distribution: GLBZ magic, the
 raw length as u32, then a raw DEFLATE stream (deflate.odin). Reading
 paths never go through here — the mmap tier stays uncompressed; this
 is for shipping and archiving. Scratch and the output allocate in `a`:
-the scratch is ~0.5 MiB of LZ77 state plus ~8 bytes per input byte
+the scratch is ~0.5 MiB of LZ77 state plus ~4 bytes per input byte
 (the recorded decisions), so pass a temp or roomy allocator — decode
 has no such appetite.
 
 `max_chain` is the DEFLATE effort dial (deflate_compress's doc): lower
-is faster with a worse ratio. The GLBZ bytes differ per level but every
-level decodes to the same blob — compressed bytes are never
-content-addressed (Payload_Key is hash-based) — so hosts pick their
-point freely; the default is DEFLATE_DEFAULT_CHAIN: −45% wall vs
+is faster with a worse ratio. The GLBZ bytes differ per level and per
+writer policy (match interiors are not inserted into the hash chains)
+but every stream decodes to the same blob — compressed bytes are
+never content-addressed (Payload_Key is hash-based) — so hosts pick
+their point freely; the default is DEFLATE_DEFAULT_CHAIN: −45% wall vs
 chain 32 at −0.23% ratio, with chain 32 itself dominated (chain 16 is
 both faster and smaller).
 */

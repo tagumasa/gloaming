@@ -148,7 +148,7 @@ just corpus-ja      # stage the JP bench corpus from 青空文庫 (network)
 - Prefer the just recipes over raw odin commands: the recipes carry the
   collections, the thread pin, and the log gating.
 - The toolchain is the pinned Odin nightly (currently
-  `dev-2026-09-nightly:a2fb372`; CI pins the frozen dev-YYYY-M release
+  `dev-2026-10-nightly:84bc3fc`; CI pins the frozen dev-YYYY-M release
   plus a hard version assert). After any compiler update: re-run every
   gate, re-pin, and re-baseline docs/benchmarks.md.
 - Commits are English conventional style (`fix:`, `feat:`, `perf:`,
@@ -255,6 +255,8 @@ These are settled structural rules. Violations get flagged in review.
   `-define:ODIN_TEST_NAMES` build.** Single-test builds changed the
   binary's layout and segfaulted on green code once; reproduce any
   single-test crash against the full run before debugging the code.
+  (The filter exists only as a `-define:` — an `ODIN_TEST_NAMES`
+  environment variable does not filter at all.)
 - **Committed fixtures stay synthetic** (business-style documents,
   hand-written sentences, the golden DSL→match table under
   `tests/fixtures/`). The corpus never enters the tree; numbers derived
@@ -346,7 +348,12 @@ about ownership or scope — the two things Odin makes explicit.
   surfaces as wrong results (an empty table, a phantom count), never
   a typed refusal; sizing the arena for the whole request — parse,
   cursor, and results together — is a host contract (docs/design.md,
-  "API discipline").
+  "API discipline"). The same silent class holds after the make: a map
+  insert whose growth allocation fails is dropped in place — no error,
+  `len` unmoved — so a table that grows at runtime must verify the
+  insert took (a post-insert lookup) before treating the map as owning
+  anything; a pre-sized map filled within capacity never grows and is
+  immune.
 - A `[]T{...}` literal whose elements are compile-time constants lives
   in **static/stack storage** — `delete` on it is an immediate bad
   free, and anything a `defer` will delete must be `make`-made and
@@ -367,6 +374,14 @@ about ownership or scope — the two things Odin makes explicit.
   - indexing a `::` constant with a variable index is a compile error —
     materialize the table into a local (`table := TOOLS`) and index
     that.
+  - `matrix` and `distinct` are keywords (the SIMD type; the
+    distinct-type declaration — `Doc_Id :: distinct u32`): neither can
+    name a field, local, or parameter, and `distinct` cascades parse
+    errors far from its use site.
+  - a named return cannot be shadowed by a multi-value local — inside
+    `proc() -> (table: T, err: E)`, bind a fresh local
+    (`t, merr := make(...)`) and return it; reusing `table` is the
+    compile error "Direct shadowing of the named return value".
   - never return a string/view into a local stack buffer or a builder
     that a defer destroys — clone out.
   - a `Dynamic_Arena` is self-referential: never return or copy one by

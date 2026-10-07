@@ -19,26 +19,26 @@ jobs:
 
       # The nightly distribution replaces assets under the same date key,
       # so consecutive runs can silently test different compilers. The
-      # dev-YYYY-MM GitHub releases are frozen assets; dev-2026-09 is
-      # exactly dev-2026-09-nightly:a2fb372, the build this repository
+      # dev-YYYY-MM GitHub releases are frozen assets; dev-2026-10 is
+      # exactly dev-2026-10-nightly:84bc3fc, the build this repository
       # is developed against. Re-pin deliberately when bumping the
       # toolchain (and re-baseline docs/benchmarks.md with it).
-      - name: Set up Odin (dev-2026-09)
+      - name: Set up Odin (dev-2026-10)
         uses: laytan/setup-odin@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          release: dev-2026-09
+          release: dev-2026-10
 
       # Hard gate: anything other than the pinned toolchain fails the job
       # here. The setup action's failure modes (missing token, missing
       # asset) silently fall back to a git-based build of a different
       # revision, which reintroduces exactly the moving-compiler problem
       # the pin exists to prevent — a fallback must be visible.
-      - name: Assert Odin toolchain (dev-2026-09-nightly:a2fb372)
+      - name: Assert Odin toolchain (dev-2026-10-nightly:84bc3fc)
         shell: bash
         run: |
           odin version
-          odin version | grep -q 'dev-2026-09-nightly:a2fb372'
+          odin version | grep -q 'dev-2026-10-nightly:84bc3fc'
 
       # Odin invokes `clang` from PATH for every link; on darwin which
       # clang answers is environment state we do not control. Odin
