@@ -86,7 +86,7 @@ cmd_graph :: proc(rest: []string, g: ^Globals) -> int {
 	ids, icode := doc_ids(&rs.m, doc_sel, a)
 	if icode != 0 { return icode }
 
-	pairs_all, capped, mcode := merged_pairs(&rs, ids, &fs, window, cap_n, a)
+	pairs_all, capped, mcode := population_pairs(&rs, ids, &fs, window, cap_n, g.threads, a)
 	if mcode != 0 { return mcode }
 	truncated := capped
 	pairs_out := pairs_all
@@ -105,7 +105,7 @@ cmd_graph :: proc(rest: []string, g: ^Globals) -> int {
 			return analysis_errorf("graph: --clusters %d exceeds the %d words in the network",
 				clusters, len(keys))
 		}
-		dist, dcode := distance_table(pairs_out, keys, distance, a)
+		dist, dcode := distance_table(pairs_out, keys, distance, g.threads, a)
 		if dcode != 0 { return dcode }
 		merges, merr := gl.linkage_merges(dist, len(keys), method, a)
 		if merr != .None {

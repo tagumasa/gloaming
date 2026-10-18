@@ -16,12 +16,15 @@ import "core:mem"
 import "core:os"
 import "core:strconv"
 import "core:strings"
+import "core:thread"
 
 import gl "gloaming:gloaming"
 import glexport "gloaming:glexport"
 import moli "moli:moli"
 import mv "core:mem/virtual"
 import ma "gladapter:moli_adapter"
+
+import "base:intrinsics"
 
 // one loaded dictionary state: the analyzer (or the fixture), its
 // dictionary_hash (0 for the id-less schema), and the reusable Viterbi
@@ -194,6 +197,166 @@ ingest_one :: proc(st: gl.Store, eng: ^Eng, doc: gl.Doc_Id, path: string,
 	}, 0
 }
 
+// ---- the parallel analyze phase (the --threads dial) ----
+
+Ingest_Fail :: enum {
+	None,
+	Read,     // the file could not be read
+	Tokenize, // moli refused; terr carries the reason
+}
+
+// one file's analysis, held until the caller's add walk reaches it
+Ingest_Slot :: struct {
+	text: string,
+	toks: []gl.Token,
+	segs: []gl.Segment,
+	fail: Ingest_Fail,
+	terr: moli.Tokenize_Err,
+}
+
+Ingest_Worker :: struct {
+	eng:     ^Eng, // the analyzer is immutable post-load (moli's contract) — shared
+	files:   []string,
+	ids:     []gl.Doc_Id,
+	jobs:    ^Ingest_Jobs, // the shared claim counter and stop flag
+	scratch: ^mv.Arena, // this worker's text and tokens — no reset, the slots live to the join
+	slots:   []Ingest_Slot,
+}
+
+// one claim counter and one stop flag for every lane
+Ingest_Jobs :: struct {
+	next: int,
+	stop: int,
+}
+
+ingest_worker_entry :: proc(data: rawptr) {
+	w := cast(^Ingest_Worker)data
+	wa := mv.arena_allocator(w.scratch)
+	context.allocator = wa
+	context.temp_allocator = wa
+	for {
+		if intrinsics.atomic_load_explicit(&w.jobs.stop, .Seq_Cst) != 0 { return }
+		i := intrinsics.atomic_add_explicit(&w.jobs.next, 1, .Seq_Cst)
+		if i >= len(w.files) { return }
+		slot := &w.slots[i]
+		fdata, rerr := os.read_entire_file_from_path(w.files[i], wa)
+		if rerr != nil {
+			slot.fail = .Read
+			intrinsics.atomic_store_explicit(&w.jobs.stop, 1, .Seq_Cst)
+			return
+		}
+		text := transmute(string)fdata
+		out: [dynamic]gl.Token = make([dynamic]gl.Token, 0, 64, wa)
+		sout: [dynamic]gl.Segment = make([dynamic]gl.Segment, 0, 16, wa)
+		if w.eng.kind == .Moli {
+			terr := ma.tokenize_document(w.eng.an, text, {}, 0, &out, wa)
+			if terr != nil {
+				slot.fail = .Tokenize
+				slot.terr = terr
+				intrinsics.atomic_store_explicit(&w.jobs.stop, 1, .Seq_Cst)
+				return
+			}
+		} else {
+			fixture_tokenize(text, &out)
+		}
+		ma.markdown_segments(text, 0, w.ids[i], &sout)
+		slot.text = text
+		slot.toks = out[:]
+		slot.segs = sout[:]
+	}
+}
+
+/*
+ingest_slots is the parallel analyze phase: every file read and
+tokenized into its slot on a worker's growing scratch arena, the file
+index claimed off a shared atomic counter. Workers share only the
+immutable analyzer and never touch the store — the adds are the
+caller's thread's, in file order, after the join (the single-writer
+rule, so no lock exists anywhere). A worker's refusal halts claiming;
+the add walk renders failures in file order with the serial run's
+messages. The caller runs this only for threads > 1 — the serial path
+is ingest_one, interleaved as always. The returned arenas back the
+slots' text and tokens: destroy them (ingest_arenas_drop) only after
+the add walk has consumed every slot.
+*/
+ingest_slots :: proc(eng: ^Eng, files: []string, ids: []gl.Doc_Id,
+                     threads: int, a: mem.Allocator) -> (slots: []Ingest_Slot,
+                     arenas: []^mv.Arena, code: int) {
+	w := threads
+	if w > len(files) { w = len(files) }
+	if w < 1 { w = 1 }
+	slots = make([]Ingest_Slot, len(files), a)
+	arenas = make([]^mv.Arena, w, a)
+	jobs := Ingest_Jobs{}
+	workers := make([]Ingest_Worker, w, a)
+	threads_out := make([dynamic]^thread.Thread, 0, w - 1, a)
+	for i in 0..<w {
+		arenas[i] = new_scratch(a)
+		if arenas[i] == nil {
+			ingest_arenas_drop(arenas, a)
+			return nil, nil, io_errorf("scratch arena init failed")
+		}
+		workers[i] = Ingest_Worker{
+			eng = eng, files = files, ids = ids, jobs = &jobs,
+			scratch = arenas[i], slots = slots,
+		}
+		if i > 0 {
+			if t := thread.create_and_start_with_data(&workers[i], ingest_worker_entry); t != nil {
+				append(&threads_out, t)
+			}
+		}
+	}
+	// the caller is worker 0; the context pin is the worker's, so the
+	// ambient returns with the call
+	caller_context := context
+	ingest_worker_entry(&workers[0])
+	context = caller_context
+	for t in threads_out {
+		thread.join(t)
+		thread.destroy(t)
+	}
+	delete(threads_out)
+	if len(workers) > 0 { mem.free(raw_data(workers), a) }
+	return slots, arenas, 0
+}
+
+// the slots' text and tokens borrow the arenas — drop after the adds
+ingest_arenas_drop :: proc(arenas: []^mv.Arena, a: mem.Allocator) {
+	for ar in arenas {
+		if ar != nil { mv.arena_destroy(ar); free(ar, a) }
+	}
+	if len(arenas) > 0 { mem.free(raw_data(arenas), a) }
+}
+
+// the add walk's failure rendering — file order, the serial run's
+// messages (the analyze phase recorded, this renders)
+ingest_slot_error :: proc(slot: ^Ingest_Slot, path: string,
+                          a: mem.Allocator) -> int {
+	if slot.fail == .Read { return io_errorf("cannot read %s", path) }
+	if slot.fail == .Tokenize {
+		return analysis_errorf("tokenize failed: %s",
+			moli.tokenize_error_message(slot.terr, a))
+	}
+	return 0
+}
+
+// the add phase's one file: the store write and the manifest row —
+// the caller's thread only (the single writer)
+ingest_add_one :: proc(st: gl.Store, slot: ^Ingest_Slot, doc: gl.Doc_Id,
+                       path: string, a: mem.Allocator) -> (Doc_Row, int) {
+	if serr := st.add_document(st.ctx, doc, slot.text, slot.toks, slot.segs); serr != .None {
+		return {}, analysis_errorf("store refused %s: %v", path, serr)
+	}
+	return Doc_Row{
+		id = u32(doc),
+		path = clone_str(path, a),
+		bytes = len(slot.text),
+		tokens = len(slot.toks),
+		segments = len(slot.segs),
+		text_hash = hash.fnv64a(transmute([]u8)slot.text),
+	}, 0
+}
+
 // ---- commands ----
 
 cmd_init :: proc(rest: []string, g: ^Globals) -> int {
@@ -317,11 +480,26 @@ cmd_init :: proc(rest: []string, g: ^Globals) -> int {
 	if len(files) == 0 { return io_errorf("no .md files under the given roots") }
 
 	docs: [dynamic]Doc_Row = make([dynamic]Doc_Row, 0, len(files), a)
-	for f, i in files {
-		row, icode := ingest_one(st, &eng, gl.Doc_Id(i), f, a)
-		if icode != 0 { return icode }
-		append(&docs, row)
-		if !g.quiet { fmt.eprintf("ingested %s\n", f) }
+	if g.threads > 1 {
+		ids := make([]gl.Doc_Id, len(files), a)
+		for i in 0..<len(files) { ids[i] = gl.Doc_Id(i) }
+		slots, iarenas, scode := ingest_slots(&eng, files, ids, g.threads, a)
+		if scode != 0 { return scode }
+		defer ingest_arenas_drop(iarenas, a)
+		for f, i in files {
+			if ferr := ingest_slot_error(&slots[i], f, a); ferr != 0 { return ferr }
+			row, aerr := ingest_add_one(st, &slots[i], ids[i], f, a)
+			if aerr != 0 { return aerr }
+			append(&docs, row)
+			if !g.quiet { fmt.eprintf("ingested %s\n", f) }
+		}
+	} else {
+		for f, i in files {
+			row, icode := ingest_one(st, &eng, gl.Doc_Id(i), f, a)
+			if icode != 0 { return icode }
+			append(&docs, row)
+			if !g.quiet { fmt.eprintf("ingested %s\n", f) }
+		}
 	}
 
 	entries := 0
@@ -466,22 +644,41 @@ cmd_add :: proc(rest: []string, g: ^Globals) -> int {
 	for d in m.docs {
 		if d.id >= next { next = d.id + 1 }
 	}
-	for id in st.docs(st.ctx) {
+	for id in st.docs(st.ctx, a) {
 		if u32(id) >= next { next = u32(id) + 1 }
 	}
 
 	docs: [dynamic]Doc_Row = make([dynamic]Doc_Row, 0, len(m.docs) + len(files), a)
 	for d in m.docs { append(&docs, d) }
 	rows: [dynamic]string = make([dynamic]string, 0, len(files), a)
-	for f in files {
-		row, icode := ingest_one(st, &eng, gl.Doc_Id(next), f, a)
-		if icode != 0 { return icode }
-		append(&docs, row)
-		next += 1
-		if !g.quiet { fmt.eprintf("ingested %s\n", f) }
-		append(&rows, doc_row_json(row, false, a))
-		m.docs = docs[:]
-		if acode := manifest_save(dir, &m, a); acode != 0 { return acode }
+	if g.threads > 1 {
+		ids := make([]gl.Doc_Id, len(files), a)
+		for i in 0..<len(files) { ids[i] = gl.Doc_Id(next + u32(i)) }
+		slots, iarenas, scode := ingest_slots(&eng, files, ids, g.threads, a)
+		if scode != 0 { return scode }
+		defer ingest_arenas_drop(iarenas, a)
+		for f, i in files {
+			if ferr := ingest_slot_error(&slots[i], f, a); ferr != 0 { return ferr }
+			row, aerr := ingest_add_one(st, &slots[i], ids[i], f, a)
+			if aerr != 0 { return aerr }
+			append(&docs, row)
+			next += 1
+			if !g.quiet { fmt.eprintf("ingested %s\n", f) }
+			append(&rows, doc_row_json(row, false, a))
+			m.docs = docs[:]
+			if mscode := manifest_save(dir, &m, a); mscode != 0 { return mscode }
+		}
+	} else {
+		for f in files {
+			row, icode := ingest_one(st, &eng, gl.Doc_Id(next), f, a)
+			if icode != 0 { return icode }
+			append(&docs, row)
+			next += 1
+			if !g.quiet { fmt.eprintf("ingested %s\n", f) }
+			append(&rows, doc_row_json(row, false, a))
+			m.docs = docs[:]
+			if acode := manifest_save(dir, &m, a); acode != 0 { return acode }
+		}
 	}
 	emit_envelope("add", eng.hash, "", false, join_rows(rows[:], a), a)
 	return EXIT_OK

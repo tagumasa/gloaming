@@ -3,12 +3,13 @@ package main
 /*
 The analysis layer: freq, cooc, and the cluster pipeline's shared
 front. freq rides the corpus layer (corpus_freq fills the true
-cross-document docs count); cooc is per-document co_occurrence merged
-host-side — pairs never cross documents — with the cap visible in the
-envelope when it bites (any per-document cap or the merged slice);
-the default cap is 20,000 pairs. The cluster front below (network
-keys, the distance menu) feeds cluster, coords, and graph
---clusters — one pipeline, so the labels agree across all three.
+cross-document docs count); cooc rides it too (corpus_cooc merges
+the per-document pairs — pairs never cross documents) with the cap
+visible in the envelope when it bites (any per-document cap or the
+merged slice); the default cap is 20,000 pairs. The cluster front
+below (network keys, the distance menu) feeds cluster, coords, and
+graph --clusters — one pipeline, so the labels agree across all
+three.
 */
 
 import "core:fmt"
@@ -90,8 +91,8 @@ parse_filter_flags :: proc(rest: []string, i: ^int, fs: ^Filter_Spec,
 // keyness .Tokens basis or a variant diff needs; the scored tables'
 // filters never weight it
 token_population :: proc(st: gl.Store, ids: []gl.Doc_Id, label: string,
-                         a: mem.Allocator) -> (int, int) {
-	tot, err := gl.corpus_freq(st, ids, gl.Freq_Filter{}, a)
+                         a: mem.Allocator, workers: int) -> (int, int) {
+	tot, err := gl.corpus_freq(st, ids, gl.Freq_Filter{}, a, nil, nil, workers)
 	if err != .None { return 0, analysis_errorf("corpus_freq (%s): %v", label, err) }
 	n := 0
 	for e in tot { n += e.count }
@@ -135,7 +136,7 @@ cmd_freq :: proc(rest: []string, g: ^Globals) -> int {
 	ids, icode := doc_ids(&rs.m, doc_sel, a)
 	if icode != 0 { return icode }
 
-	entries, serr := gl.corpus_freq(rs.st, ids, build_filter(&fs), a)
+	entries, serr := gl.corpus_freq(rs.st, ids, build_filter(&fs), a, nil, nil, g.threads)
 	if serr != .None {
 		return analysis_errorf("corpus_freq: %v", serr)
 	}
@@ -163,48 +164,23 @@ Pair_Key :: struct {
 	a, b: string,
 }
 
-pair_less :: proc(x, y: ^gl.Co_Pair) -> bool {
-	if x.n != y.n { return x.n > y.n }
-	c := strings.compare(x.a, y.a)
-	if c != 0 { return c < 0 }
-	return strings.compare(x.b, y.b) < 0
-}
-
-// cooc and graph share the merge: per-document co_occurrence over
-// the population, accumulated host-side (pairs never cross
-// documents) and sorted strongest first. The bool says a
-// per-document max_pairs cap bit; the caller's own slice cut is the
-// caller's truncated flag.
-merged_pairs :: proc(rs: ^Read_State, ids: []gl.Doc_Id, fs: ^Filter_Spec,
-                     window: int, cap_n: int,
-                     a: mem.Allocator) -> ([]gl.Co_Pair, bool, int) {
-	merged: map[Pair_Key]int = make(map[Pair_Key]int, a)
-	capped := false
-	for id in ids {
-		stream, serr := load_stream(rs, id, a)
-		if serr != .None {
-			return nil, false, analysis_errorf("store read doc %d: %v", u32(id), serr)
-		}
-		pairs, pairs_truncated, ferr := gl.co_occurrence(stream, nil, gl.Cooc_Options{
-			filter = build_filter(fs),
-			unit = .Segments,
-			window = window,
-			max_pairs = cap_n,
-		}, a)
-		if ferr != .None {
-			return nil, false, analysis_errorf("co_occurrence: %s", freq_err_text(ferr))
-		}
-		if pairs_truncated { capped = true }
-		for p in pairs {
-			merged[Pair_Key{a = p.a, b = p.b}] += p.n
-		}
+// the population's co-occurrence pairs — the library's cross-document
+// accumulator (pairs never cross documents), with the cap visible in
+// the envelope when it bites (any per-document cap or the caller's
+// slice cut). The bool says a per-document max_pairs cap bit.
+population_pairs :: proc(rs: ^Read_State, ids: []gl.Doc_Id, fs: ^Filter_Spec,
+                         window: int, cap_n: int, workers: int,
+                         a: mem.Allocator) -> ([]gl.Co_Pair, bool, int) {
+	pairs, capped, err := gl.corpus_cooc(rs.st, ids, gl.Cooc_Options{
+		filter = build_filter(fs),
+		unit = .Segments,
+		window = window,
+		max_pairs = cap_n,
+	}, a, nil, nil, workers)
+	if err != .None {
+		return nil, false, analysis_errorf("corpus_cooc: %v", err)
 	}
-	out: [dynamic]gl.Co_Pair = make([dynamic]gl.Co_Pair, 0, len(merged), a)
-	for k, n in merged {
-		append(&out, gl.Co_Pair{a = k.a, b = k.b, n = n})
-	}
-	gl.sort_with_buffer(out[:], pair_less, a)
-	return out[:], capped, 0
+	return pairs, capped, 0
 }
 
 /*
@@ -244,7 +220,7 @@ network_keys :: proc(pairs: []gl.Co_Pair, a: mem.Allocator) -> []string {
 }
 
 distance_table :: proc(pairs: []gl.Co_Pair, keys: []string, kind: Dist_Kind,
-                       a: mem.Allocator) -> ([]f64, int) {
+                       workers: int, a: mem.Allocator) -> ([]f64, int) {
 	switch kind {
 	case .Jaccard:
 		d, err := gl.cooc_distance(pairs, keys, a)
@@ -259,7 +235,7 @@ distance_table :: proc(pairs: []gl.Co_Pair, keys: []string, kind: Dist_Kind,
 		}
 		m := gl.Weight_Distance.Euclid
 		if kind == .Cosine { m = .Cosine }
-		d, derr := gl.weight_distance(w, len(keys), m, a)
+		d, derr := gl.weight_distance(w, len(keys), m, a, workers)
 		if derr != .None {
 			return nil, analysis_errorf("weight_distance: %s", freq_err_text(derr))
 		}
@@ -339,7 +315,7 @@ cmd_cooc :: proc(rest: []string, g: ^Globals) -> int {
 	ids, icode := doc_ids(&rs.m, doc_sel, a)
 	if icode != 0 { return icode }
 
-	pairs_all, capped, mcode := merged_pairs(&rs, ids, &fs, 0, cap_n, a)
+	pairs_all, capped, mcode := population_pairs(&rs, ids, &fs, 0, cap_n, g.threads, a)
 	if mcode != 0 { return mcode }
 	truncated := capped
 	pairs_out := pairs_all

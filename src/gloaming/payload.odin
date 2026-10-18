@@ -264,6 +264,10 @@ payload_decode :: proc(blob: []u8, text: string, resolver: Payload_Resolver,
 	if int(h.text_len) != len(text) { return {}, .Bad_Range }
 
 	toks := make([]Token, h.token_count, a)
+	// a refusal returns no allocation: the defer frees the half-built
+	// array on every error return below
+	committed := false
+	defer if !committed { delete(toks, a) }
 	tail := PAYLOAD_HEADER_SIZE + int(h.token_count) * PAYLOAD_REC_SIZE
 	tail_off := tail
 	tail_end := tail + int(h.tail_len)
@@ -327,6 +331,7 @@ payload_decode :: proc(blob: []u8, text: string, resolver: Payload_Resolver,
 		}
 	}
 	if tail_off != tail_end { return {}, .Malformed } // every tail byte belongs to a token
+	committed = true
 	return toks, .None
 }
 

@@ -15,6 +15,7 @@ writing. Writes the base state, so --variant refuses.
 
 import "core:fmt"
 import "core:mem"
+import mv "core:mem/virtual"
 import "core:strings"
 
 import gl "gloaming:gloaming"
@@ -48,6 +49,48 @@ codes_row_json :: proc(rid: int, kind: string, from, to: gl.Entity_Id,
 	fmt.sbprintf(&b, "%d", evidence)
 	strings.write_string(&b, "}")
 	return strings.to_string(b)
+}
+
+/*
+The enumeration fan-out: one slot per document, the body loads the
+stream and enumerates the rule's pairs on the worker's own arena;
+the single derived-relation write stays on the main thread after the
+join, over evidence assembled in document order — byte-identical to
+the serial loop at every width. The rule's parsed patterns are
+immutable, and reads never touch store-owned memory, so no lane
+shares mutable state with another.
+*/
+
+Codes_Slot :: struct {
+	spans: []gl.Span, // this doc's evidence (a then b per pair), worker arena
+	pairs: int,
+	trunc: bool,
+	lerr:  gl.Store_Err,
+	qerr:  gl.Query_Err,
+}
+
+Codes_Ctx :: struct {
+	rs:    ^Read_State,
+	ids:   []gl.Doc_Id,
+	rule:  ^gl.Coding_Rule,
+	slots: []Codes_Slot,
+}
+
+codes_body :: proc(ctx: rawptr, i: int, wa: mem.Allocator) {
+	c := cast(^Codes_Ctx)ctx
+	s := &c.slots[i]
+	stream, lerr := load_stream(c.rs, c.ids[i], wa)
+	if lerr != .None { s.lerr = lerr; return }
+	res, qerr := gl.graph_code_pairs(c.rule, stream, wa)
+	if qerr != .None { s.qerr = qerr; return }
+	if res.truncated { s.trunc = true }
+	spans: [dynamic]gl.Span = make([dynamic]gl.Span, 0, 2 * len(res.pairs), wa)
+	for p in res.pairs {
+		append(&spans, p.a)
+		append(&spans, p.b)
+	}
+	s.spans = spans[:]
+	s.pairs = len(res.pairs)
 }
 
 cmd_codes :: proc(rest: []string, g: ^Globals) -> int {
@@ -101,21 +144,51 @@ cmd_codes :: proc(rest: []string, g: ^Globals) -> int {
 
 	pairs, docs_with, truncated := 0, 0, false
 	ev: [dynamic]gl.Span = make([dynamic]gl.Span, 0, 0, a)
-	for id in ids {
-		stream, lerr := load_stream(&rs, id, a)
-		if lerr != .None {
-			return analysis_errorf("codes: doc %d read: %v", u32(id), lerr)
+	codes_arenas: []^mv.Arena
+	if g.threads > 1 && len(ids) > 0 {
+		cc := Codes_Ctx{
+			rs = &rs, ids = ids, rule = &rule,
+			slots = make([]Codes_Slot, len(ids), a),
 		}
-		res, qerr := gl.graph_code_pairs(&rule, stream, a)
-		if qerr != .None { return pattern_errorf(qerr, -1) }
-		if res.truncated { truncated = true }
-		if len(res.pairs) > 0 { docs_with += 1 }
-		for p in res.pairs {
-			append(&ev, p.a)
-			append(&ev, p.b)
-			pairs += 1
+		ra, fok := reads_fanout(&rs, ids, g.threads, codes_body, &cc, a)
+		if !fok { return io_errorf("codes read fan-out arena init failed") }
+		codes_arenas = ra
+		// refusals report in document order — the serial loop's rule
+		for i in 0..<len(ids) {
+			if cc.slots[i].lerr != .None {
+				return analysis_errorf("codes: doc %d read: %v", u32(ids[i]),
+					cc.slots[i].lerr)
+			}
+			if cc.slots[i].qerr != .None { return pattern_errorf(cc.slots[i].qerr, -1) }
+		}
+		for i in 0..<len(ids) {
+			s := &cc.slots[i]
+			if s.trunc { truncated = true }
+			if s.pairs > 0 { docs_with += 1 }
+			append(&ev, ..s.spans)
+			pairs += s.pairs
+		}
+	} else {
+		for id in ids {
+			stream, lerr := load_stream(&rs, id, a)
+			if lerr != .None {
+				return analysis_errorf("codes: doc %d read: %v", u32(id), lerr)
+			}
+			res, qerr := gl.graph_code_pairs(&rule, stream, a)
+			if qerr != .None { return pattern_errorf(qerr, -1) }
+			if res.truncated { truncated = true }
+			if len(res.pairs) > 0 { docs_with += 1 }
+			for p in res.pairs {
+				append(&ev, p.a)
+				append(&ev, p.b)
+				pairs += 1
+			}
 		}
 	}
+	// the workers' arenas die at the procedure's scope (a branch-level
+	// defer would fire at the branch's end); ev holds span VALUES copied
+	// at the merge, so only the slots' slices reference them
+	defer if codes_arenas != nil { read_arenas_drop(codes_arenas, a) }
 	if truncated && !dry {
 		return analysis_errorf("codes %s: pair cap hit (--cap %d) — nothing written; raise --cap and rerun",
 			pos[0], cap_n)

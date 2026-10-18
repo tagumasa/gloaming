@@ -11,12 +11,14 @@ diagnostics.
 
 import "core:fmt"
 import "core:os"
+import "core:strconv"
 import "core:strings"
 
 Globals :: struct {
 	project: string,
 	quiet:   bool,
 	variant: string,
+	threads: int, // the fan-out dial: 1 (the default) is serial, byte-identical at any value
 }
 
 /*
@@ -31,9 +33,11 @@ Command :: struct {
 	usage: string,
 }
 
-USAGE_HEADER :: "usage: gloaming [--project <dir>] [--quiet] [--variant <name>] <command> [args]\n\ncommands:\n"
+USAGE_HEADER :: "usage: gloaming [--project <dir>] [--quiet] [--variant <name>] [--threads N] <command> [args]\n\ncommands:\n"
 
 USAGE_NOTES :: `
+--threads N fans corpus-scale passes and ingestion out across N
+workers (default 1, serial); outputs are byte-identical at any value.
 --doc accepts a document id or a unique path suffix; evidence spans
 (<doc>:<start>-<end>) are decimal byte ranges; keyness --reference
 defaults to rest (the corpus minus the target).
@@ -47,7 +51,7 @@ cost -3000. exit codes: 0 ok, 1 usage, 2 pattern, 3 analysis refusal,
 4 project/IO.
 `
 
-COMMANDS: [23]Command = {
+COMMANDS: [24]Command = {
 	{"init", cmd_init, `  init <corpus…> --lang <ja|zh-CN|zh-TW|zh-HK|en-GB|en-US|de> [--dict <csv>]
                 [--variant-of <project>:<variant>]`},
 	{"status", cmd_status, `  status | docs`},
@@ -70,6 +74,7 @@ COMMANDS: [23]Command = {
 	{"relation", cmd_relation, `  relation add <kind> <from> <to> [--evidence <doc>:<s>-<e>]… [--derived]
         | relation list`},
 	{"mention", cmd_mention, `  mention add <entity> <doc>:<start>-<end> | mention list`},
+	{"compact", cmd_compact, `  compact`},
 	{"codes", cmd_codes, `  codes <kind> <from> <to> <patA> <patB> [--window N] [--cap M] [--dry-run]`},
 	{"toposort", cmd_toposort, `  toposort [--kind K]… [--format tsv|json]`},
 	{"keyness", cmd_keyness, `  keyness --target <all|doc:D,…|key=val> [--reference <sel>]
@@ -117,16 +122,17 @@ Global_Flag :: struct {
 	alt:   string, // the short spelling, "" when none
 }
 
-GLOBAL_FLAGS: [4]Global_Flag = {
+GLOBAL_FLAGS: [5]Global_Flag = {
 	{"--project", true,  false, ""},
 	{"--quiet",   false, false, ""},
 	{"--variant", true,  false, ""},
+	{"--threads", true,  false, ""},
 	{"--help",    false, true,  "-h"},
 }
 
-main :: proc() {
+	main :: proc() {
 	args := os.args[1:]
-	g := Globals{}
+	g := Globals{threads = 1}
 	i := 0
 	for ; i < len(args); i += 1 {
 		arg := args[i]
@@ -157,6 +163,12 @@ main :: proc() {
 		switch f.name {
 		case "--project": g.project = v
 		case "--variant": g.variant = v
+		case "--threads":
+			n, pok := strconv.parse_int(v, 10)
+			if !pok || n < 1 {
+				os.exit(usage_errorf("bad --threads value %s", v))
+			}
+			g.threads = int(n)
 		}
 	}
 	if i >= len(args) {

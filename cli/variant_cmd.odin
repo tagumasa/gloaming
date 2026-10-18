@@ -521,9 +521,9 @@ variant_diff :: proc(rest: []string, g: ^Globals) -> int {
 	if icode != 0 { return icode }
 
 	// totals: the zero-filter count is the token population per side
-	tokens_a, tacode := token_population(st_a, ids, sa.name, a)
+	tokens_a, tacode := token_population(st_a, ids, sa.name, a, g.threads)
 	if tacode != 0 { return tacode }
-	tokens_b, tbcode := token_population(st_b, ids, sb.name, a)
+	tokens_b, tbcode := token_population(st_b, ids, sb.name, a, g.threads)
 	if tbcode != 0 { return tbcode }
 
 	unk_a, unk_b := 0, 0
@@ -540,9 +540,9 @@ variant_diff :: proc(rest: []string, g: ^Globals) -> int {
 		}
 	}
 
-	fa, faerr := gl.corpus_freq(st_a, ids, build_filter(&fs), a)
+	fa, faerr := gl.corpus_freq(st_a, ids, build_filter(&fs), a, nil, nil, g.threads)
 	if faerr != .None { return analysis_errorf("corpus_freq (%s): %v", sa.name, faerr) }
-	fb, fberr := gl.corpus_freq(st_b, ids, build_filter(&fs), a)
+	fb, fberr := gl.corpus_freq(st_b, ids, build_filter(&fs), a, nil, nil, g.threads)
 	if fberr != .None { return analysis_errorf("corpus_freq (%s): %v", sb.name, fberr) }
 	ca: map[string]int = make(map[string]int, a)
 	for e in fa { ca[e.lemma] = e.count }

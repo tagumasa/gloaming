@@ -13,7 +13,7 @@ document-side clustering / MDS, cross-tabulation) had nothing to
 run on.
 
 Every proc here takes the caller's population as a Doc_Id list —
-`store.docs(ctx)` ascending for the whole corpus, a subset for a group
+`store.docs(ctx, a)` ascending for the whole corpus, a subset for a group
 (the cross tables pass doc_groups slices). Iteration follows the list as given, so
 ascending lists make reproducible runs. A duplicate Doc_Id in the list
 is .Duplicate (assoc_scores' deterministic duplicate refusal, mapped
@@ -35,8 +35,9 @@ for an interactive host.
 corpus_freq :: proc(store: Store, docs: []Doc_Id, filter: Freq_Filter,
                     a: mem.Allocator,
                     check: proc(user: rawptr) -> bool = nil,
-                    user: rawptr = nil) -> ([]Freq_Entry, Store_Err) {
-	counts, ndocs, err := corpus_count_maps(store, docs, filter, a, check, user)
+                    user: rawptr = nil,
+                    workers: int = 1) -> ([]Freq_Entry, Store_Err) {
+	counts, ndocs, err := corpus_count_maps(store, docs, filter, a, check, user, workers)
 	if err != .None { return {}, err }
 	defer delete(counts)
 	defer delete(ndocs)
@@ -60,25 +61,32 @@ duplicate Doc_Id refuses .Duplicate here so every counting caller
 (corpus_freq, cross_table's per-group pass) shares the rule. Both maps
 are the caller's to delete. One map pass per document merged into the
 corpus map. The optional stop-check polls once per document —
-.Interrupted leaves both maps deleted.
+.Interrupted leaves both maps deleted. The trailing `workers` dial is
+the corpus-pass fan-out (fanout.odin): workers > 1 fans the documents
+across lanes inside the call, byte-identical at every width.
 */
 corpus_count_maps :: proc(store: Store, docs: []Doc_Id, filter: Freq_Filter,
                           a: mem.Allocator,
                           check: proc(user: rawptr) -> bool = nil,
-                          user: rawptr = nil) -> (counts: map[string]int,
+                          user: rawptr = nil,
+                          workers: int = 1) -> (counts: map[string]int,
                           ndocs: map[string]int, err: Store_Err) {
-	counts = make(map[string]int, a)
-	ndocs = make(map[string]int, a)
 	listed := make(map[Doc_Id]bool, a)
 	defer delete(listed)
 	for d in docs {
 		if _, dup := listed[d]; dup {
-			delete(counts)
-			delete(ndocs)
 			return {}, {}, .Duplicate
 		}
 		listed[d] = true
 	}
+	if fanout_width(workers, docs) > 1 {
+		fcounts, fndocs, ferr, fanned := count_maps_fanout(store, docs, filter,
+			a, check, user, workers)
+		if fanned { return fcounts, fndocs, ferr }
+		// the caller lane's arenas refused — the serial body below
+	}
+	counts = make(map[string]int, a)
+	ndocs = make(map[string]int, a)
 	for d in docs {
 		if check != nil && check(user) {
 			delete(counts)
@@ -136,12 +144,18 @@ Doc_Profile :: struct {
 doc_profiles :: proc(store: Store, docs: []Doc_Id, filter: Freq_Filter,
                      a: mem.Allocator,
                      check: proc(user: rawptr) -> bool = nil,
-                     user: rawptr = nil) -> ([]Doc_Profile, Store_Err) {
+                     user: rawptr = nil,
+                     workers: int = 1) -> ([]Doc_Profile, Store_Err) {
 	listed := make(map[Doc_Id]bool, a)
 	defer delete(listed)
 	for d in docs {
 		if _, dup := listed[d]; dup { return {}, .Duplicate }
 		listed[d] = true
+	}
+	if fanout_width(workers, docs) > 1 {
+		pout, perr, panned := profiles_fanout(store, docs, filter, a, check, user, workers)
+		if panned { return pout, perr }
+		// the caller lane's arenas refused — the serial body below
 	}
 	out := make([]Doc_Profile, len(docs), a)
 	for d, i in docs {
@@ -344,7 +358,8 @@ Tf_Mode :: enum {
 doc_matrix :: proc(profiles: []Doc_Profile, keys: []string, df: []Freq_Entry,
                    mode: Tf_Mode, a: mem.Allocator,
                    check: proc(user: rawptr) -> bool = nil,
-                   user: rawptr = nil) -> ([]f64, Freq_Err) {
+                   user: rawptr = nil,
+                   workers: int = 1) -> ([]f64, Freq_Err) {
 	n := len(profiles)
 	if !profiles_ordered(profiles) { return {}, .Bad_Count }
 	df_by := make(map[string]int, a)
@@ -374,6 +389,12 @@ doc_matrix :: proc(profiles: []Doc_Profile, keys: []string, df: []Freq_Entry,
 		}
 	}
 	w := make([]f64, n * len(keys), a)
+	if workers > 1 && n > 0 {
+		fw, ferr, fanned := matrix_fanout(profiles, keys, &key_ix, idf, mode,
+			a, check, user, workers)
+		if fanned { return fw, ferr }
+		// no fan-out lanes — the serial loop below fills `w` itself
+	}
 	for p, d in profiles {
 		if check != nil && check(user) {
 			if len(w) > 0 { mem.free(raw_data(w), a) }
@@ -493,7 +514,8 @@ Cross_Table :: struct {
 cross_table :: proc(store: Store, groups: []Doc_Group, filter: Freq_Filter,
                     a: mem.Allocator,
                     check: proc(user: rawptr) -> bool = nil,
-                    user: rawptr = nil) -> (Cross_Table, Store_Err) {
+                    user: rawptr = nil,
+                    workers: int = 1) -> (Cross_Table, Store_Err) {
 	vals := make([]string, len(groups), a)
 	sizes := make([]int, len(groups), a)
 	for grp, j in groups {
@@ -517,7 +539,7 @@ cross_table :: proc(store: Store, groups: []Doc_Group, filter: Freq_Filter,
 	table_filter := filter
 	table_filter.min_count = 0 // the table counts, the host slices (above)
 	for grp, j in groups {
-		counts, ndocs, err := corpus_count_maps(store, grp.docs, table_filter, a, check, user)
+		counts, ndocs, err := corpus_count_maps(store, grp.docs, table_filter, a, check, user, workers)
 		if err != .None {
 			// a refusal allocates nothing net (ms_add_document's rule) —
 			// every buffer here owns its delete through a defer except
@@ -679,4 +701,79 @@ table_chi2 :: proc(t: ^Cross_Table) -> (f64, Freq_Err) {
 		}
 	}
 	return chi, .None
+}
+
+// the accumulator's map key — two counting keys as one value
+Co_Pair_Key :: struct {
+	a, b: string,
+}
+
+// pair rows: n descending, then a ascending, then b ascending — the
+// total order the merged table sorts by
+co_pair_less :: proc(x, y: ^Co_Pair) -> bool {
+	if x.n != y.n { return x.n > y.n }
+	c := strings.compare(x.a, y.a)
+	if c != 0 { return c < 0 }
+	return strings.compare(x.b, y.b) < 0
+}
+
+/*
+The cross-document co-occurrence accumulator: per-document
+co_occurrence over the population — pairs never cross documents —
+summed into one table, the merge hosts used to own. `capped` flags a
+per-document max_pairs bite; the caller's own slice cut stays the
+caller's truncated flag. Rows are ordered n descending, then a
+ascending, then b ascending — count-table shaped, hosts slice top-k.
+Duplicate docs refuse .Duplicate (the counting rule); a doc the store
+lacks surfaces the backend's Store_Err unchanged. Keys borrow the
+backend's token views (the store-read view discipline). co_occurrence's
+Freq_Err crosses as .Interrupted for the stop-check and .Malformed
+otherwise — its remaining members are opts-shape refusals the caller
+controls. The trailing `workers` dial is the corpus-pass fan-out —
+byte-identical at every width.
+*/
+corpus_cooc :: proc(store: Store, docs: []Doc_Id, opts: Cooc_Options,
+                    a: mem.Allocator,
+                    check: proc(user: rawptr) -> bool = nil,
+                    user: rawptr = nil,
+                    workers: int = 1) -> (pairs: []Co_Pair, capped: bool,
+                    err: Store_Err) {
+	listed := make(map[Doc_Id]bool, a)
+	defer delete(listed)
+	for d in docs {
+		if _, dup := listed[d]; dup { return {}, false, .Duplicate }
+		listed[d] = true
+	}
+	if fanout_width(workers, docs) > 1 {
+		fpairs, fcapped, ferr, fanned := cooc_fanout(store, docs, opts,
+			a, check, user, workers)
+		if fanned { return fpairs, fcapped, ferr }
+		// the caller lane's arenas refused — the serial body below
+	}
+	merged: map[Co_Pair_Key]int = make(map[Co_Pair_Key]int, a)
+	defer delete(merged)
+	for d in docs {
+		if check != nil && check(user) { return {}, false, .Interrupted }
+		toks, terr := store.tokens(store.ctx, d, a)
+		if terr != .None { return {}, false, terr }
+		segs, serr := store.segments(store.ctx, d, a)
+		if serr != .None { return {}, false, serr }
+		stream := Token_Stream{doc = d, tokens = toks, segments = segs}
+		doc_pairs, doc_trunc, ferr := co_occurrence(stream, nil, opts, a)
+		if ferr != .None {
+			if ferr == .Interrupted { return {}, false, .Interrupted }
+			return {}, false, .Malformed
+		}
+		if doc_trunc { capped = true }
+		for p in doc_pairs {
+			merged[Co_Pair_Key{a = p.a, b = p.b}] += p.n
+		}
+	}
+	out: [dynamic]Co_Pair = make([dynamic]Co_Pair, 0, len(merged), a)
+	for k, n in merged {
+		append(&out, Co_Pair{a = k.a, b = k.b, n = n})
+	}
+	pairs = out[:]
+	sort_with_buffer(pairs, co_pair_less, a)
+	return pairs, capped, .None
 }

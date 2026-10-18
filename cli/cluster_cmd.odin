@@ -86,7 +86,7 @@ cmd_cluster :: proc(rest: []string, g: ^Globals) -> int {
 	ids, icode := doc_ids(&rs.m, doc_sel, a)
 	if icode != 0 { return icode }
 
-	pairs_all, capped, mcode := merged_pairs(&rs, ids, &fs, window, cap_n, a)
+	pairs_all, capped, mcode := population_pairs(&rs, ids, &fs, window, cap_n, g.threads, a)
 	if mcode != 0 { return mcode }
 	truncated := capped
 	pairs_out := pairs_all
@@ -103,7 +103,7 @@ cmd_cluster :: proc(rest: []string, g: ^Globals) -> int {
 		return analysis_errorf("cluster: --k %d exceeds the %d words in the network",
 			k, len(keys))
 	}
-	dist, dcode := distance_table(pairs_out, keys, distance, a)
+	dist, dcode := distance_table(pairs_out, keys, distance, g.threads, a)
 	if dcode != 0 { return dcode }
 	merges, merr := gl.linkage_merges(dist, len(keys), method, a)
 	if merr != .None {
@@ -218,7 +218,7 @@ cmd_coords :: proc(rest: []string, g: ^Globals) -> int {
 	ids, icode := doc_ids(&rs.m, doc_sel, a)
 	if icode != 0 { return icode }
 
-	pairs_all, capped, mcode := merged_pairs(&rs, ids, &fs, window, cap_n, a)
+	pairs_all, capped, mcode := population_pairs(&rs, ids, &fs, window, cap_n, g.threads, a)
 	if mcode != 0 { return mcode }
 	truncated := capped
 	pairs_out := pairs_all
@@ -232,7 +232,7 @@ cmd_coords :: proc(rest: []string, g: ^Globals) -> int {
 	if werr != .None {
 		return analysis_errorf("cooc_weights: %s", freq_err_text(werr))
 	}
-	coords, qerr := gl.power_coords(w, len(keys), tol, max_iter, a)
+	coords, qerr := gl.power_coords(w, len(keys), tol, max_iter, a, nil, nil, g.threads)
 	if qerr != .None {
 		return analysis_errorf("power_coords: %s", freq_err_text(qerr))
 	}

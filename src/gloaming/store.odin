@@ -53,9 +53,11 @@ interface; nil procs are caller error — documented precondition, no
 runtime check, matching the library's discipline of trusting explicit
 state.
 
-Reads (`tokens`/`segments`) may return borrowed views — valid until
-the next mutating call on the same backend; the `a` parameter is
-where a materializing backend (the disk tier) decodes onto. Hosts assemble
+Reads land on the caller's `a`: `docs` copies the maintained ascending
+list; `tokens`/`segments` may return borrowed views — valid until
+the next mutating call on the same backend — and the `a` parameter is
+where a materializing backend (the disk tier) decodes onto. Concurrent
+reads never touch store-owned memory. Hosts assemble
 Token_Stream from these reads; the port itself never mentions the
 read APIs. Unbounded by design: the reference backend must hold a
 whole corpus (160k morphemes ≈ 17 MB of Tokens) — bounding it
@@ -64,7 +66,7 @@ bounded-cache business.
 */
 Store :: struct {
 	ctx:             rawptr,
-	docs:            proc(ctx: rawptr) -> []Doc_Id,
+	docs:            proc(ctx: rawptr, a: mem.Allocator) -> []Doc_Id,
 	has:             proc(ctx: rawptr, doc: Doc_Id) -> bool,
 	tokens:          proc(ctx: rawptr, doc: Doc_Id,
 	                       a: mem.Allocator) -> ([]Token, Store_Err),
@@ -141,11 +143,12 @@ ids_remove :: proc(ids: ^[dynamic]Doc_Id, doc: Doc_Id) {
 	resize(ids, len(ids^) - 1)
 }
 
-ms_docs :: proc(ctx: rawptr) -> []Doc_Id {
+ms_docs :: proc(ctx: rawptr, a: mem.Allocator) -> []Doc_Id {
 	ms := cast(^Memory_Store)ctx
-	// a copy of the maintained ascending list — map iteration is
-	// unordered, the list makes the order stable without a sort
-	out := make([]Doc_Id, len(ms.ids), ms.arena)
+	// a copy of the maintained ascending list onto the caller's
+	// allocator — map iteration is unordered, the list makes the order
+	// stable without a sort
+	out := make([]Doc_Id, len(ms.ids), a)
 	copy(out, ms.ids[:])
 	return out
 }

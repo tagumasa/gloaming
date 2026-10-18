@@ -15,6 +15,12 @@ the adapter demonstrates). Decode materializes onto the caller's `a`
 (the port's materializing-backend clause); surfaces view the
 registry's text, resolved strings the resolver's storage, unknown pos
 strings the caller's blob buffer.
+
+disk_store_compact (below) rewrites both files to the current state
+through a journaled swap; the open completes or discards an
+interrupted swap before reading anything, so every crash point of a
+compaction reopens to one whole state. The `cache_max_bytes` dial
+enables the bounded token cache (cache.odin) on the `tokens` read.
 */
 package gloaming
 
@@ -24,6 +30,16 @@ import "core:os"
 
 DISK_REGISTRY :: "registry.glr"
 DISK_PAYLOADS :: "payloads.glb"
+
+// the compaction swap's artifacts, beside the store files: the two
+// tmp rewrites and the journal whose presence means both tmps are
+// durable and the renames must complete (disk_swap_recover)
+DISK_TMP_REGISTRY :: "registry.glr.tmp"
+DISK_TMP_PAYLOADS :: "payloads.glb.tmp"
+DISK_JOURNAL      :: "compact.glj"
+
+COMPACT_JOURNAL_MAGIC    :: "GLCJ"
+COMPACT_JOURNAL_VERSION  :: u32(1)
 
 Disk_Doc :: struct {
 	key:      Payload_Key,
@@ -47,6 +63,8 @@ Disk_Store :: struct {
 	rctx:         rawptr,
 	dict_version: u64, // what the resolver resolves against — refusal gate
 	options:      u32, // Payload_Key.options for payloads this store writes
+	tcache:       ^Bounded_Cache, // nil = cache off (cache_max_bytes == 0)
+	dir:          string, // store directory, cloned — the swap artifacts live beside the store files
 }
 
 disk_read_all :: proc(f: ^os.File, dst: []u8, at: i64) -> os.Error {
@@ -74,15 +92,17 @@ close via disk_store_close, which every host calls exactly once.
 A torn registry tail (crash mid-append) is repaired at open: the file
 truncates to the last committed batch and the store proceeds. Payload
 bytes appended without a committed reference are orphans — dead space
-until compaction, never wrong. The optional stop-check polls once per
-registry frame during the open replay — .Interrupted closes and
-frees the half-built store like any open refusal.
+until disk_store_compact reclaims them, never wrong. The optional
+stop-check polls once per registry frame during the open replay —
+.Interrupted closes and frees the half-built store like any open
+refusal.
 */
 store_disk :: proc(dir: string, resolver: Payload_Resolver, rctx: rawptr,
                    dict_version: u64, options: u32,
                    a: mem.Allocator,
                    check: proc(user: rawptr) -> bool = nil,
-                   user: rawptr = nil) -> (Store, ^Disk_Store, Store_Err) {
+                   user: rawptr = nil,
+                   cache_max_bytes: int = 0) -> (Store, ^Disk_Store, Store_Err) {
 	if !os.exists(dir) {
 		if err := os.mkdir(dir); err != nil { return {}, nil, .Io }
 	}
@@ -100,6 +120,7 @@ store_disk :: proc(dir: string, resolver: Payload_Resolver, rctx: rawptr,
 		rctx         = rctx,
 		dict_version = dict_version,
 		options      = options,
+		dir          = clone_str(dir, a),
 	}
 	graph_init(&ds.graph, a)
 	fail :: proc(ds: ^Disk_Store, e: Store_Err) -> (Store, ^Disk_Store, Store_Err) {
@@ -107,9 +128,14 @@ store_disk :: proc(dir: string, resolver: Payload_Resolver, rctx: rawptr,
 		graph_destroy(&ds.graph)
 		delete(ds.docs)
 		delete(ds.ids)
+		if len(ds.dir) > 0 { mem.free(raw_data(transmute([]u8)ds.dir), ds.a) }
 		free(ds, ds.a)
 		return {}, nil, e
 	}
+
+	// an interrupted compaction's swap completes or is discarded
+	// before any file is read
+	if rerr := disk_swap_recover(dir); rerr != .None { return fail(ds, .Io) }
 
 	flags := os.File_Flags{.Read, .Write, .Create}
 	log_f, oerr := os.open(log_path, flags, os.Permissions_Default_File)
@@ -178,6 +204,13 @@ store_disk :: proc(dir: string, resolver: Payload_Resolver, rctx: rawptr,
 		}
 	}
 
+	// the bounded-cache dial (cache.odin); created last, so no
+	// open-failure path above needs to free a cache
+	if cache_max_bytes > 0 {
+		ds.tcache = new(Bounded_Cache, a)
+		bounded_cache_init(ds.tcache, a, cache_max_bytes)
+	}
+
 	store := Store{
 		ctx             = ds,
 		docs            = ds_docs,
@@ -209,11 +242,12 @@ disk_store_close :: proc(ds: ^Disk_Store) -> Store_Err {
 	return err
 }
 
-ds_docs :: proc(ctx: rawptr) -> []Doc_Id {
+ds_docs :: proc(ctx: rawptr, a: mem.Allocator) -> []Doc_Id {
 	ds := cast(^Disk_Store)ctx
-	// a copy of the maintained ascending list — same ownership as the
-	// memory backend, without the per-call rebuild and sort
-	out := make([]Doc_Id, len(ds.ids), ds.a)
+	// a copy of the maintained ascending list onto the caller's
+	// allocator — same ownership as the memory backend, without the
+	// per-call rebuild and sort
+	out := make([]Doc_Id, len(ds.ids), a)
 	copy(out, ds.ids[:])
 	return out
 }
@@ -238,16 +272,82 @@ ds_tokens :: proc(ctx: rawptr, doc: Doc_Id, a: mem.Allocator) -> ([]Token, Store
 	d, ok := ds.docs[doc]
 	if !ok { return {}, .Not_Found }
 
+	if ds.tcache != nil {
+		// a hit is a probe over an immutable slot: one struct-array
+		// copy onto `a`; the string bytes its tokens view are
+		// cache-owned (the port's borrow clause). A miss falls
+		// through to the plain decode on `a` — a read never mutates
+		// the cache (concurrent reads, design.md "API discipline");
+		// filling is disk_store_cache_warm's business
+		if cached := bounded_cache_get(ds.tcache, doc); cached != nil {
+			out := make([]Token, len(cached), a)
+			copy(out, cached)
+			return out, .None
+		}
+	}
+
 	blob := make([]u8, d.len, a)
 	if rerr := disk_read_all(ds.pay_f, blob, d.off); rerr != nil { return {}, .Io }
 	h, herr := payload_header(blob)
-	if herr != .None { return {}, .Malformed }
+	if herr != .None { return {}, herr }
 	if h.dict_version != ds.dict_version {
 		// the refusal protocol: decoding would resolve entry ids
 		// against a dictionary state the key never described
 		return {}, .Stale
 	}
 	return payload_decode(blob, d.text, ds.resolver, ds.rctx, a)
+}
+
+/*
+disk_store_cache_warm fills the token cache for the given documents:
+each uncached document is decoded once onto the cache's allocator and
+published as an immutable slot; an already-cached document is skipped
+(idempotent — removal drops a slot, and a live doc's slot always
+reflects the current payload, so a skip never serves stale bytes). A
+document whose decoded size alone exceeds the budget is skipped (the
+cache's own rule); an unknown document answers .Not_Found. Eviction
+drains oldest-first in insertion order — the deterministic order —
+until the budget holds. A quiescent-point call under the store's
+single-writer exclusion, the same lane as add/remove/compact; cache
+off (the cache_max_bytes == 0 default) is a legitimate configuration,
+so the call is a no-op. The per-document stop-check answers
+.Interrupted with the slots already published left in place — they
+are bounded and valid.
+*/
+disk_store_cache_warm :: proc(ds: ^Disk_Store, docs: []Doc_Id,
+                              check: proc(user: rawptr) -> bool = nil,
+                              user: rawptr = nil) -> Store_Err {
+	if ds.tcache == nil { return .None }
+	for doc in docs {
+		if check != nil && check(user) { return .Interrupted }
+		if bounded_cache_has(ds.tcache, doc) { continue }
+		d, ok := ds.docs[doc]
+		if !ok { return .Not_Found }
+		ca := ds.tcache.allocator
+		blob := make([]u8, d.len, ca)
+		if rerr := disk_read_all(ds.pay_f, blob, d.off); rerr != nil {
+			delete(blob, ca)
+			return .Io
+		}
+		h, herr := payload_header(blob)
+		if herr != .None {
+			delete(blob, ca)
+			return herr
+		}
+		if h.dict_version != ds.dict_version {
+			// the refusal protocol: a payload the open dictionary
+			// never described is not cacheable material
+			delete(blob, ca)
+			return .Stale
+		}
+		toks, derr := payload_decode(blob, d.text, ds.resolver, ds.rctx, ca)
+		if derr != .None {
+			delete(blob, ca)
+			return derr
+		}
+		bounded_cache_put(ds.tcache, doc, blob, toks)
+	}
+	return .None
 }
 
 /*
@@ -299,7 +399,8 @@ ds_add_document :: proc(ctx: rawptr, doc: Doc_Id, text: string,
 	return .None
 }
 
-// a tombstone batch; the payload bytes become orphans (compaction business)
+// a tombstone batch; the payload bytes become orphans —
+// disk_store_compact reclaims them
 ds_remove_document :: proc(ctx: rawptr, doc: Doc_Id) -> Store_Err {
 	ds := cast(^Disk_Store)ctx
 	if _, live := ds.docs[doc]; !live { return .Not_Found }
@@ -312,6 +413,9 @@ ds_remove_document :: proc(ctx: rawptr, doc: Doc_Id) -> Store_Err {
 
 	delete_key(&ds.docs, doc)
 	ids_remove(&ds.ids, doc)
+	if ds.tcache != nil {
+		bounded_cache_drop(ds.tcache, doc)
+	}
 	return .None
 }
 
@@ -608,5 +712,435 @@ graph_entity_merge :: proc(ds: ^Disk_Store, into, from: Entity_Id) -> Store_Err 
 		if !flags[i] { continue }
 		graph_apply_relation(g, rows[i])
 	}
+	return .None
+}
+
+// ---- compaction: the full-state rewrite and its crash-safe swap ----
+
+disk_path :: proc(dir, name: string) -> string {
+	path, _ := os.join_path({dir, name}, context.temp_allocator)
+	return path
+}
+
+/*
+disk_swap_recover completes or discards an interrupted compaction's
+swap. A journal file means both tmp rewrites were durable: complete
+the renames (each skipped when its tmp is gone — the rename may
+already have happened), then remove the journal. Without a journal
+the tmp bytes are uncommitted: remove them. Idempotent and
+order-preserving, so every crash point in disk_store_compact reopens
+to one whole state — old or new, never mixed.
+*/
+disk_swap_recover :: proc(dir: string) -> Store_Err {
+	journal := disk_path(dir, DISK_JOURNAL)
+	if os.exists(journal) {
+		if terr := disk_swap_rename(dir, DISK_TMP_PAYLOADS, DISK_PAYLOADS); terr != nil {
+			return .Io
+		}
+		if terr := disk_swap_rename(dir, DISK_TMP_REGISTRY, DISK_REGISTRY); terr != nil {
+			return .Io
+		}
+		if rerr := os.remove(journal); rerr != nil { return .Io }
+		return .None
+	}
+	_ = disk_swap_remove(dir, DISK_TMP_PAYLOADS)
+	_ = disk_swap_remove(dir, DISK_TMP_REGISTRY)
+	return .None
+}
+
+disk_swap_rename :: proc(dir, tmp_name, final_name: string) -> os.Error {
+	tmp := disk_path(dir, tmp_name)
+	if !os.exists(tmp) { return nil }
+	return os.rename(tmp, disk_path(dir, final_name))
+}
+
+disk_swap_remove :: proc(dir, name: string) -> os.Error {
+	path := disk_path(dir, name)
+	if !os.exists(path) { return nil }
+	return os.remove(path)
+}
+
+// the pre-journal failure path: remove both tmps; the store files
+// are untouched
+compact_abort :: proc(dir: string) {
+	_ = disk_swap_remove(dir, DISK_TMP_PAYLOADS)
+	_ = disk_swap_remove(dir, DISK_TMP_REGISTRY)
+}
+
+// frees a scan's outputs when the scanned state is not adopted
+// (every failure path in disk_store_compact)
+rec_scan_release :: proc(scan: ^Rec_Scan, a: mem.Allocator) {
+	for _, rec in scan.docs {
+		if len(rec.segments) > 0 { mem.free(raw_data(rec.segments), a) }
+	}
+	graph_destroy(&scan.graph)
+	delete(scan.docs)
+}
+
+// the pre-journal failure path with the batch built: free the scan
+// and the new bytes, remove the tmps
+compact_rollback :: proc(scan: ^Rec_Scan, new_buf: []u8, a: mem.Allocator, dir: string) {
+	if scan != nil { rec_scan_release(scan, a) }
+	if len(new_buf) > 0 { delete(new_buf, a) }
+	compact_abort(dir)
+}
+
+// the post-journal failure path: reopen recovery owns the files
+// (disk_swap_recover completes the swap); only the built memory is
+// freed here
+compact_release_built :: proc(scan: ^Rec_Scan, new_buf: []u8, a: mem.Allocator) {
+	rec_scan_release(scan, a)
+	delete(new_buf, a)
+}
+
+// whether `s` views bytes inside `span` — tells a log_buf view from
+// an independently allocated clone when the old state is released
+slice_views :: proc(span: []u8, s: string) -> bool {
+	if len(span) == 0 || len(s) == 0 { return false }
+	p := cast(uintptr)raw_data(transmute([]u8)s)
+	lo := cast(uintptr)raw_data(span)
+	return p >= lo && p < lo + cast(uintptr)len(span)
+}
+
+// the kind string for a row read back from a batch; an id outside
+// the vocabulary (a dead row carries KIND_NONE) is ""
+compact_kind_str :: proc(g: ^Doc_Graph, k: Kind_Id) -> string {
+	if int(k) < 0 || int(k) >= len(g.kinds) { return "" }
+	return g.kinds[k]
+}
+
+/*
+compact_state_equal is the rewrite's self-check: the batch must scan
+back to the state that produced it — same documents (key, text,
+segments), same rows (ids, live flags, names, endpoints, evidence,
+kind strings), same attrs in row order. Payload offsets are exempt:
+the dense re-copy moves them.
+*/
+compact_state_equal :: proc(ds: ^Disk_Store, scan: ^Rec_Scan) -> bool {
+	if len(scan.docs) != len(ds.docs) { return false }
+	g0 := &ds.graph
+	g1 := &scan.graph
+	if len(g1.entities) != len(g0.entities) { return false }
+	if len(g1.relations) != len(g0.relations) { return false }
+	if len(g1.mentions) != len(g0.mentions) { return false }
+	if len(g1.attrs) != len(g0.attrs) { return false }
+
+	for doc, d in ds.docs {
+		r, ok := scan.docs[doc]
+		if !ok { return false }
+		if r.key != d.key || r.payload_len != d.len || r.text != d.text { return false }
+		if len(r.segments) != len(d.segments) { return false }
+		for i in 0..<len(d.segments) {
+			if r.segments[i].kind != d.segments[i].kind ||
+				r.segments[i].span.start != d.segments[i].span.start ||
+				r.segments[i].span.end != d.segments[i].span.end { return false }
+		}
+	}
+	for i in 0..<len(g0.entities) {
+		x := &g0.entities[i]
+		y := &g1.entities[i]
+		if x.live != y.live || x.id != y.id { return false }
+		if !x.live { continue }
+		if x.name != y.name { return false }
+		if len(x.aliases) != len(y.aliases) { return false }
+		for j in 0..<len(x.aliases) {
+			if x.aliases[j] != y.aliases[j] { return false }
+		}
+		if compact_kind_str(g0, x.kind) != compact_kind_str(g1, y.kind) { return false }
+	}
+	for i in 0..<len(g0.relations) {
+		x := &g0.relations[i]
+		y := &g1.relations[i]
+		if x.live != y.live || x.id != y.id || x.derived != y.derived ||
+			x.from != y.from || x.to != y.to { return false }
+		if !x.live { continue }
+		if len(x.evidence) != len(y.evidence) { return false }
+		for j in 0..<len(x.evidence) {
+			if x.evidence[j] != y.evidence[j] { return false }
+		}
+		if compact_kind_str(g0, x.kind) != compact_kind_str(g1, y.kind) { return false }
+	}
+	for i in 0..<len(g0.mentions) {
+		if g0.mentions[i] != g1.mentions[i] { return false }
+	}
+	for i in 0..<len(g0.attrs) {
+		x := &g0.attrs[i]
+		y := &g1.attrs[i]
+		if x.doc != y.doc || x.key != y.key || x.val != y.val { return false }
+	}
+	return true
+}
+
+// frees the old graph's cloned strings (a string viewing `span`
+// frees with the span), then its containers
+compact_release_graph :: proc(g: ^Doc_Graph, span: []u8, a: mem.Allocator) {
+	for row in g.entities {
+		if len(row.name) > 0 && !slice_views(span, row.name) {
+			mem.free(raw_data(transmute([]u8)row.name), a)
+		}
+		for al in row.aliases {
+			if len(al) > 0 && !slice_views(span, al) {
+				mem.free(raw_data(transmute([]u8)al), a)
+			}
+		}
+	}
+	for attr in g.attrs {
+		if len(attr.key) > 0 && !slice_views(span, attr.key) {
+			mem.free(raw_data(transmute([]u8)attr.key), a)
+		}
+		if len(attr.val) > 0 && !slice_views(span, attr.val) {
+			mem.free(raw_data(transmute([]u8)attr.val), a)
+		}
+	}
+	graph_destroy(g)
+}
+
+/*
+disk_store_compact rewrites the store to its current state: one
+registry batch — live documents with their payloads re-copied dense,
+live curation rows, dead entity/relation rows written as tombstones
+so row ids stay stable, current attrs — and a payloads file with no
+orphans. The batch is scanned back and compared against the
+in-memory state (compact_state_equal) before anything commits, then
+written through a crash-safe swap: payloads tmp, registry tmp,
+journal, two renames, journal removed. Every crash point reopens to
+one whole state: before the journal the old files are intact, after
+it disk_swap_recover completes the renames. Kind ids may renumber to
+ascending-first-seen order; Kind_Id is internal and every API reads
+kind strings, so the observable state is unchanged.
+
+A quiescent-point call under the store's single-writer exclusion.
+.Interrupted and any pre-journal .Io leave the files and the
+in-memory state untouched. An .Io from inside the swap leaves the
+swap for reopen recovery to complete — close and reopen before
+further use: the open file handles still address the pre-swap
+inodes, so reads would return the old bytes.
+*/
+disk_store_compact :: proc(ds: ^Disk_Store,
+                           check: proc(user: rawptr) -> bool = nil,
+                           user: rawptr = nil) -> Store_Err {
+	tmp_pay := disk_path(ds.dir, DISK_TMP_PAYLOADS)
+	tmp_reg := disk_path(ds.dir, DISK_TMP_REGISTRY)
+	journal := disk_path(ds.dir, DISK_JOURNAL)
+	// stale tmps from an aborted run; no journal can exist here
+	// (open resolves it), so removal is safe
+	_ = os.remove(tmp_pay)
+	_ = os.remove(tmp_reg)
+
+	// Phase A — the dense payloads copy, live documents ascending
+	pay_f, oerr := os.open(tmp_pay, os.File_Flags{.Write, .Create},
+		os.Permissions_Default_File)
+	if oerr != nil { return .Io }
+	new_offs: map[Doc_Id]i64 = make(map[Doc_Id]i64, context.temp_allocator)
+	defer delete(new_offs)
+	buf: []u8 = nil
+	defer if buf != nil { delete(buf, context.temp_allocator) }
+	new_end: i64 = 0
+	for doc in ds.ids {
+		if check != nil && check(user) {
+			_ = os.close(pay_f)
+			compact_abort(ds.dir)
+			return .Interrupted
+		}
+		d := ds.docs[doc]
+		if len(buf) < d.len {
+			if buf != nil { delete(buf, context.temp_allocator) }
+			buf = make([]u8, d.len, context.temp_allocator)
+		}
+		if rerr := disk_read_all(ds.pay_f, buf[:d.len], d.off); rerr != nil {
+			_ = os.close(pay_f)
+			compact_abort(ds.dir)
+			return .Io
+		}
+		if werr := disk_write_all(pay_f, buf[:d.len], new_end); werr != nil {
+			_ = os.close(pay_f)
+			compact_abort(ds.dir)
+			return .Io
+		}
+		new_offs[doc] = new_end
+		new_end += i64(d.len)
+	}
+	if serr := os.sync(pay_f); serr != nil {
+		_ = os.close(pay_f)
+		compact_abort(ds.dir)
+		return .Io
+	}
+	if cerr := os.close(pay_f); cerr != nil {
+		compact_abort(ds.dir)
+		return .Io
+	}
+
+	// Phase B — the full-state batch, built on the store allocator:
+	// it becomes ds.log_buf when the state is adopted
+	recs: [dynamic]Rec_Record = make([dynamic]Rec_Record, 0,
+		len(ds.ids) + len(ds.graph.entities) + len(ds.graph.relations) +
+			len(ds.graph.mentions) + len(ds.graph.attrs),
+		context.temp_allocator)
+	defer delete(recs)
+	for doc in ds.ids {
+		if check != nil && check(user) {
+			compact_rollback(nil, nil, ds.a, ds.dir)
+			return .Interrupted
+		}
+		d := ds.docs[doc]
+		append(&recs, Rec_Record{kind = .Doc,
+			body = rec_doc_body(doc, d.key, new_offs[doc], d.len, d.text, d.segments)})
+	}
+	for &row in ds.graph.entities {
+		if row.live {
+			append(&recs, Rec_Record{kind = .Entity,
+				body = rec_entity_body(row, compact_kind_str(&ds.graph, row.kind))})
+		} else {
+			append(&recs, Rec_Record{kind = .Entity,
+				body = rec_entity_body(Entity{id = row.id, live = false}, "")})
+		}
+	}
+	for &row in ds.graph.relations {
+		if row.live {
+			append(&recs, Rec_Record{kind = .Relation,
+				body = rec_relation_body(row, compact_kind_str(&ds.graph, row.kind))})
+		} else {
+			append(&recs, Rec_Record{kind = .Relation,
+				body = rec_relation_body(Relation{id = row.id, live = false}, "")})
+		}
+	}
+	for &m, i in ds.graph.mentions {
+		append(&recs, Rec_Record{kind = .Mention, body = rec_mention_body(i, m)})
+	}
+	for &attr in ds.graph.attrs {
+		append(&recs, Rec_Record{kind = .Attr, body = rec_attr_body(attr)})
+	}
+	batch := rec_batch(recs[:], context.temp_allocator)
+	new_buf := make([]u8, RECLOG_HEADER_SIZE + len(batch), ds.a)
+	copy(new_buf[0:4], RECLOG_MAGIC)
+	pl_put_u32(new_buf, 4, RECLOG_VERSION)
+	copy(new_buf[RECLOG_HEADER_SIZE:], batch)
+
+	scan, scerr := reclog_scan(new_buf, ds.a, check, user)
+	if scerr != .None {
+		compact_rollback(nil, new_buf, ds.a, ds.dir) // the scan cleans its own partial state
+		return scerr
+	}
+	if !compact_state_equal(ds, &scan) {
+		compact_rollback(&scan, new_buf, ds.a, ds.dir)
+		return .Malformed
+	}
+	reg_f, oerr2 := os.open(tmp_reg, os.File_Flags{.Write, .Create},
+		os.Permissions_Default_File)
+	if oerr2 != nil {
+		compact_rollback(&scan, new_buf, ds.a, ds.dir)
+		return .Io
+	}
+	if werr := disk_write_all(reg_f, new_buf, 0); werr != nil {
+		_ = os.close(reg_f)
+		compact_rollback(&scan, new_buf, ds.a, ds.dir)
+		return .Io
+	}
+	if serr2 := os.sync(reg_f); serr2 != nil {
+		_ = os.close(reg_f)
+		compact_rollback(&scan, new_buf, ds.a, ds.dir)
+		return .Io
+	}
+	if cerr2 := os.close(reg_f); cerr2 != nil {
+		compact_rollback(&scan, new_buf, ds.a, ds.dir)
+		return .Io
+	}
+
+	// Phase C — the journal: its existence is the commit point (both
+	// tmps are durable above); recovery never reads its bytes
+	jf, jerr := os.open(journal, os.File_Flags{.Write, .Create},
+		os.Permissions_Default_File)
+	if jerr != nil {
+		compact_rollback(&scan, new_buf, ds.a, ds.dir)
+		return .Io
+	}
+	jb: [8]u8
+	copy(jb[0:4], COMPACT_JOURNAL_MAGIC)
+	pl_put_u32(jb[:], 4, COMPACT_JOURNAL_VERSION)
+	if jwerr := disk_write_all(jf, jb[:], 0); jwerr != nil {
+		_ = os.close(jf)
+		compact_rollback(&scan, new_buf, ds.a, ds.dir)
+		return .Io
+	}
+	if jserr := os.sync(jf); jserr != nil {
+		_ = os.close(jf)
+		compact_rollback(&scan, new_buf, ds.a, ds.dir)
+		return .Io
+	}
+	if jcerr := os.close(jf); jcerr != nil {
+		compact_rollback(&scan, new_buf, ds.a, ds.dir)
+		return .Io
+	}
+
+	// Phase D — two renames, then fresh handles (the old handles
+	// still address the old inodes). A failure from here leaves the
+	// journal in place; reopen recovery completes the swap
+	if rerr := os.rename(tmp_pay, disk_path(ds.dir, DISK_PAYLOADS)); rerr != nil {
+		compact_release_built(&scan, new_buf, ds.a)
+		return .Io
+	}
+	if rerr := os.rename(tmp_reg, disk_path(ds.dir, DISK_REGISTRY)); rerr != nil {
+		compact_release_built(&scan, new_buf, ds.a)
+		return .Io
+	}
+	_ = os.close(ds.log_f)
+	_ = os.close(ds.pay_f)
+	nlog, nlerr := os.open(disk_path(ds.dir, DISK_REGISTRY),
+		os.File_Flags{.Read, .Write}, os.Permissions_Default_File)
+	if nlerr != nil {
+		compact_release_built(&scan, new_buf, ds.a)
+		return .Io
+	}
+	npay, nperr := os.open(disk_path(ds.dir, DISK_PAYLOADS),
+		os.File_Flags{.Read, .Write}, os.Permissions_Default_File)
+	if nperr != nil {
+		_ = os.close(nlog)
+		compact_release_built(&scan, new_buf, ds.a)
+		return .Io
+	}
+	ds.log_f = nlog
+	ds.pay_f = npay
+
+	// Phase E — adopt the scanned state, release the old one. The
+	// token cache is not flushed: it holds its own copies and keys on
+	// documents, which the rewrite does not change.
+	old_buf := ds.log_buf
+	old_docs := ds.docs
+	old_graph := ds.graph
+	old_ids := ds.ids
+	new_docs := make(map[Doc_Id]Disk_Doc, ds.a)
+	for doc, rec in scan.docs {
+		new_docs[doc] = {
+			key      = rec.key,
+			off      = rec.payload_off,
+			len      = rec.payload_len,
+			text     = rec.text,
+			segments = rec.segments,
+		}
+	}
+	delete(scan.docs) // the map table only; segment slices live on in new_docs
+	new_ids := make([dynamic]Doc_Id, 0, len(new_docs), ds.a)
+	for doc in new_docs { append(&new_ids, doc) }
+	sort_with_buffer(new_ids[:], docid_less, ds.a)
+	ds.docs = new_docs
+	ds.ids = new_ids
+	ds.graph = scan.graph
+	ds.log_buf = new_buf
+	ds.log_end = i64(len(new_buf))
+	ds.pay_end = new_end
+
+	for _, d in old_docs {
+		if len(d.segments) > 0 { mem.free(raw_data(d.segments), ds.a) }
+		if len(d.text) > 0 && !slice_views(old_buf, d.text) {
+			mem.free(raw_data(transmute([]u8)d.text), ds.a)
+		}
+	}
+	delete(old_docs)
+	compact_release_graph(&old_graph, old_buf, ds.a)
+	if len(old_buf) > 0 { mem.free(raw_data(old_buf), ds.a) }
+	delete(old_ids)
+
+	// a failed remove retries at every open (disk_swap_recover)
+	_ = os.remove(journal)
 	return .None
 }

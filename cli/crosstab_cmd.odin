@@ -61,7 +61,7 @@ cmd_crosstab :: proc(rest: []string, g: ^Globals) -> int {
 	if len(ids) == 0 { return analysis_errorf("crosstab: the project holds no documents") }
 
 	groups := gl.doc_groups(gl.graph_doc_attrs(&rs.ds.graph), attr, ids, a)
-	table, terr := gl.cross_table(rs.st, groups, build_filter(&fs), a)
+	table, terr := gl.cross_table(rs.st, groups, build_filter(&fs), a, nil, nil, g.threads)
 	if terr != .None { return analysis_errorf("cross_table: %v", terr) }
 
 	tests: []gl.Cross_Test

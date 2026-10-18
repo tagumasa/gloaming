@@ -2442,7 +2442,7 @@ memory_store_contract :: proc(t: ^testing.T) {
 
 	testing.expect(t, store.has(store.ctx, 5))
 	testing.expect(t, !store.has(store.ctx, 6))
-	docs := store.docs(store.ctx)
+	docs := store.docs(store.ctx, a)
 	if len(docs) != 1 || int(docs[0]) != 5 {
 		testing.expectf(t, false, "docs: got %d entries", len(docs))
 	}
@@ -3080,7 +3080,8 @@ reclog_frames :: proc(t: ^testing.T) {
 	_, dupnerr := gloaming.reclog_scan(rec_cat(a, {hdr2, bdupname}), a)
 	testing.expect_value(t, int(dupnerr), int(gloaming.Store_Err.Malformed))
 
-	// a tombstone for a row that never existed mints a dead row — refuse
+	// a tombstone at id > len is refused: ids are dense, and only
+	// id == len may append a dead row
 	bghost := gloaming.rec_batch([]gloaming.Rec_Record{
 		{kind = .Entity, body = gloaming.rec_entity_body(gloaming.Entity{
 			id = 7, live = false,
@@ -3088,6 +3089,32 @@ reclog_frames :: proc(t: ^testing.T) {
 	}, a)
 	_, ghosterr := gloaming.reclog_scan(rec_cat(a, {hdr2, bghost}), a)
 	testing.expect_value(t, int(ghosterr), int(gloaming.Store_Err.Malformed))
+
+	// a tombstone at id == len appends the dead row — the form a
+	// compaction rewrite uses to keep dense ids stable
+	bappend := gloaming.rec_batch([]gloaming.Rec_Record{
+		{kind = .Entity, body = gloaming.rec_entity_body(gloaming.Entity{
+			id = 0, live = true, name = "X",
+		}, "term")},
+		{kind = .Entity, body = gloaming.rec_entity_body(gloaming.Entity{
+			id = 1, live = true, name = "Y",
+		}, "term")},
+		{kind = .Entity, body = gloaming.rec_entity_body(gloaming.Entity{
+			id = 2, live = false,
+		}, "")},
+		{kind = .Relation, body = gloaming.rec_relation_body(gloaming.Relation{
+			id = 0, live = true, from = 0, to = 1, derived = true,
+		}, "codes")},
+		{kind = .Relation, body = gloaming.rec_relation_body(gloaming.Relation{
+			id = 1, live = false,
+		}, "")},
+	}, a)
+	mv3, v3err := gloaming.reclog_scan(rec_cat(a, {hdr2, bappend}), a)
+	testing.expectf(t, v3err == gloaming.Store_Err.None, "dead-row append scan: %v", v3err)
+	testing.expect_value(t, len(mv3.graph.entities), 3)
+	testing.expect(t, !mv3.graph.entities[2].live, "appended entity 2 must be dead")
+	testing.expect_value(t, len(mv3.graph.relations), 2)
+	testing.expect(t, !mv3.graph.relations[1].live, "appended relation 1 must be dead")
 
 	// the merge shape is a TRANSFER, not a collision: row 0 absorbs
 	// row 1's name in the same batch that tombstones row 1 — the
@@ -3150,6 +3177,12 @@ disk_test_wipe :: proc(a: mem.Allocator) {
 	r, p := disk_test_paths(a)
 	_ = os.remove(r)
 	_ = os.remove(p)
+	rt, _ := os.join_path({DISK_TEST_DIR, gloaming.DISK_TMP_REGISTRY}, a)
+	pt, _ := os.join_path({DISK_TEST_DIR, gloaming.DISK_TMP_PAYLOADS}, a)
+	j, _ := os.join_path({DISK_TEST_DIR, gloaming.DISK_JOURNAL}, a)
+	_ = os.remove(rt)
+	_ = os.remove(pt)
+	_ = os.remove(j)
 }
 
 // the payload_roundtrip fixture, reused as the disk store's corpus.
@@ -3239,7 +3272,7 @@ store_disk_roundtrip :: proc(t: ^testing.T) {
 		return
 	}
 
-	docs := store.docs(store.ctx)
+	docs := store.docs(store.ctx, a)
 	if !testing.expect_value(t, len(docs), 2) { return }
 	testing.expect_value(t, u32(docs[0]), 1)
 	testing.expect_value(t, u32(docs[1]), 2)
@@ -3263,7 +3296,7 @@ store_disk_roundtrip :: proc(t: ^testing.T) {
 	testing.expect_value(t, int(nf), int(gloaming.Store_Err.Not_Found))
 	testing.expect_value(t, int(store.remove_document(store.ctx, 2)),
 		int(gloaming.Store_Err.Not_Found))
-	testing.expect_value(t, len(store.docs(store.ctx)), 1)
+	testing.expect_value(t, len(store.docs(store.ctx, a)), 1)
 
 	// persistence: close, reopen, everything still true — and the
 	// refusal protocol: a different dict_version answers Stale
@@ -3272,7 +3305,7 @@ store_disk_roundtrip :: proc(t: ^testing.T) {
 	store2, ds2, rerr := gloaming.store_disk(DISK_TEST_DIR, payload_test_resolver,
 		nil, dict, 7, a)
 	if !testing.expectf(t, rerr == .None, "reopen: %v", rerr) { return }
-	docs2 := store2.docs(store2.ctx)
+	docs2 := store2.docs(store2.ctx, a)
 	if !testing.expect_value(t, len(docs2), 1) { return }
 	testing.expect_value(t, u32(docs2[0]), 1)
 	got2, g2err := store2.tokens(store2.ctx, 1, a)
@@ -3328,7 +3361,7 @@ store_disk_recovery :: proc(t: ^testing.T) {
 	s2, ds2, o2 := gloaming.store_disk(DISK_TEST_DIR, payload_test_resolver,
 		nil, dict, 0, a)
 	if !testing.expectf(t, o2 == .None, "reopen torn: %v", o2) { return }
-	testing.expect_value(t, len(s2.docs(s2.ctx)), 1)
+	testing.expect_value(t, len(s2.docs(s2.ctx, a)), 1)
 	got, gerr := s2.tokens(s2.ctx, 5, a)
 	if !testing.expectf(t, gerr == .None, "tokens after torn reopen: %v", gerr) { return }
 	ok, at := tokens_equal(toks, got)
@@ -3405,8 +3438,8 @@ store_disk_differential :: proc(t: ^testing.T) {
 	}
 
 	// docs/has agree
-	m_docs := mem_store.docs(mem_store.ctx)
-	d_docs := disk_store.docs(disk_store.ctx)
+	m_docs := mem_store.docs(mem_store.ctx, a)
+	d_docs := disk_store.docs(disk_store.ctx, a)
 	testing.expect_value(t, len(m_docs), len(d_docs))
 	for i in 0..<len(m_docs) {
 		testing.expect_value(t, u32(m_docs[i]), u32(d_docs[i]))
@@ -3441,6 +3474,495 @@ store_disk_differential :: proc(t: ^testing.T) {
 			}
 		}
 	}
+
+	// the compacted-reopen arm: the same corpus through disk + compact
+	// + reopen still agrees with the memory backend everywhere above
+	if cerr := gloaming.disk_store_compact(ds); cerr != .None {
+		testing.expectf(t, false, "compact: %v", cerr)
+		return
+	}
+	testing.expect_value(t, int(gloaming.disk_store_close(ds)), int(gloaming.Store_Err.None))
+	c_store, c_ds, crerr := gloaming.store_disk(DISK_TEST_DIR, payload_test_resolver,
+		nil, dict, 0, a)
+	if !testing.expectf(t, crerr == .None, "reopen compacted: %v", crerr) { return }
+	c_docs := c_store.docs(c_store.ctx, a)
+	testing.expect_value(t, len(c_docs), len(m_docs))
+	for i in 0..<len(m_docs) {
+		testing.expect_value(t, u32(c_docs[i]), u32(m_docs[i]))
+	}
+	for doc in m_docs {
+		mt, _ := mem_store.tokens(mem_store.ctx, doc, a)
+		ct, cterr := c_store.tokens(c_store.ctx, doc, a)
+		if !testing.expectf(t, cterr == .None, "compacted tokens %d: %v", doc, cterr) { return }
+		ok, at := tokens_equal(mt, ct)
+		testing.expectf(t, ok, "compacted doc %d tokens differ at %d", doc, at)
+		msg, _ := mem_store.segments(mem_store.ctx, doc, a)
+		csg, _ := c_store.segments(c_store.ctx, doc, a)
+		testing.expectf(t, segments_equal(msg, csg), "compacted doc %d segments differ", doc)
+	}
+	testing.expect_value(t, int(gloaming.disk_store_close(c_ds)),
+		int(gloaming.Store_Err.None))
+}
+
+// The L3 tier, frozen semantics: a bounded decoded-token cache over
+// the disk backend — a read never fills (every read is
+// field-identical to the fixture, cache on or off), the quiescent
+// warm call publishes immutable slots (idempotent, skips
+// budget-oversized documents, .Not_Found on unknown ids),
+// oldest-first deterministic eviction under a tight budget, removal
+// drops the slot, and reopen starts cold with the stale refusal
+// ahead of any fill.
+@(test)
+store_disk_token_cache :: proc(t: ^testing.T) {
+	arena: mem.Arena
+	mem.arena_init(&arena, test_arena_buf[:])
+	a := mem.arena_allocator(&arena)
+	defer mem.arena_free_all(&arena)
+
+	if !os.exists("tmp") { _ = os.mkdir("tmp") }
+	if !os.exists(DISK_TEST_DIR) { _ = os.mkdir(DISK_TEST_DIR) }
+	disk_test_wipe(a)
+	defer disk_test_wipe(a)
+
+	dict := u64(0xCAFE)
+	store, ds, serr := gloaming.store_disk(DISK_TEST_DIR, payload_test_resolver,
+		nil, dict, 0, a, cache_max_bytes = 16 * 1024)
+	if !testing.expectf(t, serr == .None, "open: %v", serr) { return }
+	defer _ = gloaming.disk_store_close(ds)
+
+	text, toks, segs := disk_test_doc(a)
+	if aerr := store.add_document(store.ctx, 1, text, toks, segs); aerr != .None {
+		testing.expectf(t, false, "add: %v", aerr)
+		return
+	}
+	doc2 := make([]gloaming.Token, 1, a)
+	doc2[0] = toks[1]
+	doc2[0].start = 0
+	doc2[0].end = 3
+	if aerr := store.add_document(store.ctx, 2, "が", doc2, nil); aerr != .None {
+		testing.expectf(t, false, "add 2: %v", aerr)
+		return
+	}
+
+	// a read never fills: field-identical to the fixture, cache empty
+	got1, g1err := store.tokens(store.ctx, 1, a)
+	if !testing.expectf(t, g1err == .None, "read tokens: %v", g1err) { return }
+	ok, at := tokens_equal(toks, got1)
+	testing.expectf(t, ok, "read tokens differ at %d", at)
+	testing.expect_value(t, len(ds.tcache.index), 0)
+
+	// warm publishes both slots; a hit is field-identical
+	docs := []gloaming.Doc_Id{1, 2}
+	if werr := gloaming.disk_store_cache_warm(ds, docs); werr != gloaming.Store_Err.None {
+		testing.expectf(t, false, "warm: %v", werr)
+		return
+	}
+	testing.expect_value(t, len(ds.tcache.index), 2)
+	testing.expect(t, ds.tcache.bytes <= ds.tcache.budget, "budget exceeded")
+	got1b, _ := store.tokens(store.ctx, 1, a)
+	ok, at = tokens_equal(toks, got1b)
+	testing.expectf(t, ok, "hit tokens differ at %d", at)
+	got2, g2err := store.tokens(store.ctx, 2, a)
+	if !testing.expectf(t, g2err == .None, "hit 2: %v", g2err) { return }
+	ok, at = tokens_equal(doc2, got2)
+	testing.expectf(t, ok, "hit 2 tokens differ at %d", at)
+
+	// warm is idempotent — a second call redecodes nothing
+	hot_bytes := ds.tcache.bytes
+	if werr := gloaming.disk_store_cache_warm(ds, docs); werr != gloaming.Store_Err.None {
+		testing.expectf(t, false, "rewarm: %v", werr)
+		return
+	}
+	testing.expect_value(t, ds.tcache.bytes, hot_bytes)
+
+	// an unknown document refuses typed
+	unknown := []gloaming.Doc_Id{9}
+	testing.expect_value(t, int(gloaming.disk_store_cache_warm(ds, unknown)),
+		int(gloaming.Store_Err.Not_Found))
+
+	// removal drops the slot; the re-add stays uncached until a warm
+	testing.expect_value(t, int(store.remove_document(store.ctx, 2)),
+		int(gloaming.Store_Err.None))
+	testing.expect_value(t, len(ds.tcache.index), 1)
+	if aerr := store.add_document(store.ctx, 2, "が", doc2, nil); aerr != .None {
+		testing.expectf(t, false, "re-add: %v", aerr)
+		return
+	}
+	refill, rerr2 := store.tokens(store.ctx, 2, a)
+	if !testing.expectf(t, rerr2 == .None, "refill read: %v", rerr2) { return }
+	ok, at = tokens_equal(doc2, refill)
+	testing.expectf(t, ok, "refill read tokens differ at %d", at)
+	testing.expect_value(t, len(ds.tcache.index), 1)
+	rewarm := []gloaming.Doc_Id{2}
+	if werr := gloaming.disk_store_cache_warm(ds, rewarm); werr != gloaming.Store_Err.None {
+		testing.expectf(t, false, "rewarm 2: %v", werr)
+		return
+	}
+	testing.expect_value(t, len(ds.tcache.index), 2)
+	// the measured charges — the tight-budget arm's dial derives from
+	// them, so it does not depend on the fixture's byte sizes
+	b1 := ds.tcache.index[gloaming.Doc_Id(1)].bytes
+	b2 := ds.tcache.index[gloaming.Doc_Id(2)].bytes
+
+	testing.expect_value(t, int(gloaming.disk_store_close(ds)), int(gloaming.Store_Err.None))
+
+	// a tight budget holds one document: warming the other evicts the
+	// oldest — insertion order, the deterministic order
+	tight_store, tight_ds, terr := gloaming.store_disk(DISK_TEST_DIR, payload_test_resolver,
+		nil, dict, 0, a, cache_max_bytes = b1 + b2 - 1)
+	if !testing.expectf(t, terr == .None, "tight open: %v", terr) { return }
+	first := []gloaming.Doc_Id{1}
+	if werr := gloaming.disk_store_cache_warm(tight_ds, first); werr != gloaming.Store_Err.None {
+		testing.expectf(t, false, "tight warm: %v", werr)
+		return
+	}
+	testing.expect_value(t, len(tight_ds.tcache.index), 1)
+	both := []gloaming.Doc_Id{1, 2}
+	if werr := gloaming.disk_store_cache_warm(tight_ds, both); werr != gloaming.Store_Err.None {
+		testing.expectf(t, false, "tight warm both: %v", werr)
+		return
+	}
+	testing.expect(t, tight_ds.tcache.bytes <= tight_ds.tcache.budget, "tight budget exceeded")
+	testing.expect_value(t, len(tight_ds.tcache.index), 1)
+	if s, has := tight_ds.tcache.index[2]; has {
+		testing.expect_value(t, u32(s.doc), 2) // the first-warmed doc was evicted
+	} else {
+		testing.expect(t, false, "doc 2 must be resident after the evict")
+	}
+	got_t, gterr := tight_store.tokens(tight_store.ctx, 2, a)
+	if !testing.expectf(t, gterr == .None, "tight hit: %v", gterr) { return }
+	ok, at = tokens_equal(doc2, got_t)
+	testing.expectf(t, ok, "tight hit tokens differ at %d", at)
+	testing.expect_value(t, int(gloaming.disk_store_close(tight_ds)),
+		int(gloaming.Store_Err.None))
+
+	// a budget smaller than one document caches nothing — reads and
+	// the warm call both still work
+	tiny_store, tiny_ds, yerr := gloaming.store_disk(DISK_TEST_DIR, payload_test_resolver,
+		nil, dict, 0, a, cache_max_bytes = 8)
+	if !testing.expectf(t, yerr == .None, "tiny open: %v", yerr) { return }
+	if werr := gloaming.disk_store_cache_warm(tiny_ds, first); werr != gloaming.Store_Err.None {
+		testing.expectf(t, false, "tiny warm: %v", werr)
+		return
+	}
+	got3, g3err := tiny_store.tokens(tiny_store.ctx, 1, a)
+	if !testing.expectf(t, g3err == .None, "tiny tokens: %v", g3err) { return }
+	ok, at = tokens_equal(toks, got3)
+	testing.expectf(t, ok, "tiny tokens differ at %d", at)
+	testing.expect_value(t, len(tiny_ds.tcache.index), 0)
+	testing.expect_value(t, int(gloaming.disk_store_close(tiny_ds)),
+		int(gloaming.Store_Err.None))
+
+	// reopen creates the cache fresh; the stale refusal still precedes it
+	c_store, c_ds, cerr := gloaming.store_disk(DISK_TEST_DIR, payload_test_resolver,
+		nil, dict, 0, a, cache_max_bytes = 16 * 1024)
+	if !testing.expectf(t, cerr == .None, "reopen: %v", cerr) { return }
+	got4, g4err := c_store.tokens(c_store.ctx, 1, a)
+	if !testing.expectf(t, g4err == .None, "reopen tokens: %v", g4err) { return }
+	ok, at = tokens_equal(toks, got4)
+	testing.expectf(t, ok, "reopen tokens differ at %d", at)
+	testing.expect_value(t, len(c_ds.tcache.index), 0)
+	testing.expect_value(t, int(gloaming.disk_store_close(c_ds)),
+		int(gloaming.Store_Err.None))
+
+	s_store, s_ds, serr2 := gloaming.store_disk(DISK_TEST_DIR, payload_test_resolver,
+		nil, dict + 1, 0, a, cache_max_bytes = 16 * 1024)
+	if !testing.expectf(t, serr2 == .None, "stale open: %v", serr2) { return }
+	testing.expect_value(t, int(gloaming.disk_store_cache_warm(s_ds, first)),
+		int(gloaming.Store_Err.Stale))
+	testing.expect_value(t, len(s_ds.tcache.index), 0) // the refusal cached nothing
+	_, stale := s_store.tokens(s_store.ctx, 1, a)
+	testing.expect_value(t, int(stale), int(gloaming.Store_Err.Stale))
+	testing.expect_value(t, int(gloaming.disk_store_close(s_ds)),
+		int(gloaming.Store_Err.None))
+}
+
+// The compact test's observable state, checked identically before the
+// rewrite, after it, and after reopen — entity 1 was merged into 0
+// (dead slot kept, names absorbed), the relation 0→2 survives with
+// both evidence spans, the mention re-pointed, the attr overwritten.
+compact_expect_graph :: proc(t: ^testing.T, g: ^gloaming.Doc_Graph) {
+	testing.expect_value(t, len(g.entities), 3)
+	testing.expect(t, g.entities[0].live, "entity 0 live")
+	testing.expect(t, !g.entities[1].live, "entity 1 dead (merged)")
+	testing.expect(t, g.entities[2].live, "entity 2 live")
+	testing.expect(t, g.entities[0].name == "A", "entity 0 name")
+	if fid, ok := gloaming.graph_entity_find(g, "B"); !ok || int(fid) != 0 {
+		testing.expectf(t, false, "merge's name transfer: B must answer to entity 0")
+	}
+	if fid, ok := gloaming.graph_entity_find(g, "A2"); !ok || int(fid) != 0 {
+		testing.expectf(t, false, "alias A2 must answer to entity 0")
+	}
+	if fid, ok := gloaming.graph_entity_find(g, "Z"); !ok || int(fid) != 2 {
+		testing.expectf(t, false, "Z must answer to entity 2")
+	}
+	testing.expect_value(t, len(g.relations), 1)
+	r := &g.relations[0]
+	testing.expect(t, r.live, "relation live")
+	testing.expect_value(t, int(r.from), 0)
+	testing.expect_value(t, int(r.to), 2)
+	testing.expect_value(t, len(r.evidence), 2)
+	testing.expect(t, g.kinds[r.kind] == "codes", "relation kind string")
+	testing.expect_value(t, len(g.mentions), 1)
+	testing.expect_value(t, int(g.mentions[0].entity), 0) // re-pointed by the merge
+	testing.expect_value(t, len(g.attrs), 1) // the overwrite left one row
+	testing.expect(t, g.attrs[0].key == "genre" && g.attrs[0].val == "horror",
+		"attr is the current row")
+}
+
+// compaction's contract: the observable state survives the rewrite
+// and every reopen (an appended tombstone keeps the dead id's slot),
+// the registry loses the write history, the payloads file shrinks to
+// exactly the live documents, and the token cache stays valid
+// without a flush.
+@(test)
+store_disk_compact :: proc(t: ^testing.T) {
+	arena: mem.Arena
+	mem.arena_init(&arena, test_arena_buf[:])
+	a := mem.arena_allocator(&arena)
+	defer mem.arena_free_all(&arena)
+
+	if !os.exists("tmp") { _ = os.mkdir("tmp") }
+	if !os.exists(DISK_TEST_DIR) { _ = os.mkdir(DISK_TEST_DIR) }
+	disk_test_wipe(a)
+	defer disk_test_wipe(a)
+
+	dict := u64(0xC0FFEE)
+	store, ds, serr := gloaming.store_disk(DISK_TEST_DIR, payload_test_resolver,
+		nil, dict, 0, a)
+	if !testing.expectf(t, serr == .None, "open: %v", serr) { return }
+
+	text, toks, segs := disk_test_doc(a)
+	if aerr := store.add_document(store.ctx, 1, text, toks, segs); aerr != .None {
+		testing.expectf(t, false, "add: %v", aerr)
+		return
+	}
+	doc2 := make([]gloaming.Token, 1, a)
+	doc2[0] = toks[1]
+	doc2[0].start = 0
+	doc2[0].end = 3
+	if aerr := store.add_document(store.ctx, 2, "が", doc2, nil); aerr != .None {
+		testing.expectf(t, false, "add 2: %v", aerr)
+		return
+	}
+	testing.expect_value(t, int(store.remove_document(store.ctx, 2)),
+		int(gloaming.Store_Err.None)) // its payload becomes the orphan
+
+	aid, aerr2 := gloaming.graph_entity_add(ds, "term", "A", nil)
+	if !testing.expectf(t, aerr2 == .None, "entity A: %v", aerr2) { return }
+	bid, berr := gloaming.graph_entity_add(ds, "term", "B", nil)
+	if !testing.expectf(t, berr == .None, "entity B: %v", berr) { return }
+	cid, cerr0 := gloaming.graph_entity_add(ds, "term", "Z", nil)
+	if !testing.expectf(t, cerr0 == .None, "entity Z: %v", cerr0) { return }
+	if alerr := gloaming.graph_entity_alias(ds, aid, "A2"); alerr != .None {
+		testing.expectf(t, false, "alias: %v", alerr)
+		return
+	}
+	ev := make([]gloaming.Span, 2, a)
+	ev[0] = {doc = 1, start = 0, end = 3}
+	ev[1] = {doc = 1, start = 3, end = 6}
+	if _, rerr := gloaming.graph_relation_add(ds, "codes", aid, cid, ev, false); rerr != .None {
+		testing.expectf(t, false, "relation: %v", rerr)
+		return
+	}
+	if _, merr := gloaming.graph_mention_add(ds, bid, gloaming.Span{doc = 1, start = 6, end = 9}); merr != .None {
+		testing.expectf(t, false, "mention: %v", merr)
+		return
+	}
+	testing.expect_value(t, int(gloaming.graph_attr_put(ds, 1, "genre", "mystery")),
+		int(gloaming.Store_Err.None))
+	testing.expect_value(t, int(gloaming.graph_attr_put(ds, 1, "genre", "horror")),
+		int(gloaming.Store_Err.None))
+	testing.expect_value(t, int(gloaming.graph_entity_merge(ds, aid, bid)),
+		int(gloaming.Store_Err.None))
+
+	pre_reg, pre_pay := ds.log_end, ds.pay_end
+	compact_expect_graph(t, &ds.graph)
+	got, gerr := store.tokens(store.ctx, 1, a)
+	if !testing.expectf(t, gerr == .None, "pre tokens: %v", gerr) { return }
+	ok, at := tokens_equal(toks, got)
+	testing.expectf(t, ok, "pre tokens differ at %d", at)
+
+	if cerr := gloaming.disk_store_compact(ds); !testing.expectf(t, cerr == .None, "compact: %v", cerr) {
+		return
+	}
+
+	// the in-memory observables are unchanged by the rewrite
+	compact_expect_graph(t, &ds.graph)
+	testing.expect_value(t, len(store.docs(store.ctx, a)), 1)
+	got2, g2err := store.tokens(store.ctx, 1, a)
+	if !testing.expectf(t, g2err == .None, "post tokens: %v", g2err) { return }
+	ok, at = tokens_equal(toks, got2)
+	testing.expectf(t, ok, "post tokens differ at %d", at)
+	// reclamation: history gone from the registry, payloads exactly live
+	testing.expect(t, ds.log_end < pre_reg, "registry must shrink")
+	testing.expect(t, ds.pay_end < pre_pay, "orphan payload must go")
+	testing.expect_value(t, ds.pay_end, i64(ds.docs[gloaming.Doc_Id(1)].len))
+
+	testing.expect_value(t, int(gloaming.disk_store_close(ds)),
+		int(gloaming.Store_Err.None))
+
+	// reopen replays the compacted v3 log — the appended tombstone
+	// keeps the dead id's slot — and a second reopen is idempotent
+	for pass in 0..<2 {
+		rstore, rds, rerr := gloaming.store_disk(DISK_TEST_DIR, payload_test_resolver,
+			nil, dict, 0, a)
+		if !testing.expectf(t, rerr == .None, "reopen %d: %v", pass, rerr) { return }
+		compact_expect_graph(t, &rds.graph)
+		testing.expect_value(t, len(rstore.docs(rstore.ctx, a)), 1)
+		got3, g3err := rstore.tokens(rstore.ctx, 1, a)
+		if !testing.expectf(t, g3err == .None, "reopen %d tokens: %v", pass, g3err) { return }
+		ok, at = tokens_equal(toks, got3)
+		testing.expectf(t, ok, "reopen %d tokens differ at %d", pass, at)
+		testing.expect_value(t, rds.log_end, ds.log_end) // the bytes are stable across reopens
+		testing.expect_value(t, int(gloaming.disk_store_close(rds)),
+			int(gloaming.Store_Err.None))
+	}
+
+	// the cache stays valid: slots key on documents, not offsets
+	cstore, cds, cerr := gloaming.store_disk(DISK_TEST_DIR, payload_test_resolver,
+		nil, dict, 0, a, cache_max_bytes = 16 * 1024)
+	if !testing.expectf(t, cerr == .None, "cache open: %v", cerr) { return }
+	warm_docs := []gloaming.Doc_Id{1}
+	if werr := gloaming.disk_store_cache_warm(cds, warm_docs); werr != gloaming.Store_Err.None {
+		testing.expectf(t, false, "cached warm: %v", werr)
+		return
+	}
+	if cerr2 := gloaming.disk_store_compact(cds); cerr2 != .None {
+		testing.expectf(t, false, "cached compact: %v", cerr2)
+		return
+	}
+	testing.expect_value(t, len(cds.tcache.index), 1) // not flushed by design
+	cgot, cgerr := cstore.tokens(cstore.ctx, 1, a)
+	if !testing.expectf(t, cgerr == .None, "post-compact cached tokens: %v", cgerr) { return }
+	ok, at = tokens_equal(toks, cgot)
+	testing.expectf(t, ok, "post-compact cached tokens differ at %d", at)
+	testing.expect_value(t, int(gloaming.disk_store_close(cds)),
+		int(gloaming.Store_Err.None))
+}
+
+
+// the crash test's one open-and-check: `want_new` selects the state by
+// file sizes, every window must decode doc 1 through a paired file set
+// and leave no swap artifacts behind
+compact_crash_open :: proc(t: ^testing.T, dict: u64, toks: []gloaming.Token,
+                           a: mem.Allocator, reg_tmp, pay_tmp, journal: string,
+                           want_new: bool, want_reg, want_pay: int, label: string) {
+	cstore, cds, cerr := gloaming.store_disk(DISK_TEST_DIR, payload_test_resolver,
+		nil, dict, 0, a)
+	if !testing.expectf(t, cerr == .None, "%s open: %v", label, cerr) { return }
+	got, gerr := cstore.tokens(cstore.ctx, 1, a)
+	if !testing.expectf(t, gerr == .None, "%s tokens: %v", label, gerr) { return }
+	ok, at := tokens_equal(toks, got)
+	testing.expectf(t, ok, "%s tokens differ at %d", label, at)
+	testing.expect_value(t, len(cstore.docs(cstore.ctx, a)), 2)
+	testing.expect_value(t, int(cds.log_end), want_reg)
+	testing.expect_value(t, int(cds.pay_end), want_pay)
+	testing.expect_value(t, int(gloaming.disk_store_close(cds)),
+		int(gloaming.Store_Err.None))
+	testing.expect(t, !os.exists(journal), "%s: journal must be gone", label)
+	testing.expect(t, !os.exists(reg_tmp), "%s: registry tmp must be gone", label)
+	testing.expect(t, !os.exists(pay_tmp), "%s: payloads tmp must be gone", label)
+}
+
+// the crash matrix: every window of the compaction swap reopens to
+// exactly one whole state — before the journal the old files are
+// intact, after it the journal completes the renames, and no mixed
+// pair ever reaches a reader
+@(test)
+store_disk_compact_crash :: proc(t: ^testing.T) {
+	arena: mem.Arena
+	mem.arena_init(&arena, test_arena_buf[:])
+	a := mem.arena_allocator(&arena)
+	defer mem.arena_free_all(&arena)
+
+	if !os.exists("tmp") { _ = os.mkdir("tmp") }
+	if !os.exists(DISK_TEST_DIR) { _ = os.mkdir(DISK_TEST_DIR) }
+	disk_test_wipe(a)
+	defer disk_test_wipe(a)
+
+	reg_path, pay_path := disk_test_paths(a)
+	reg_tmp, _ := os.join_path({DISK_TEST_DIR, gloaming.DISK_TMP_REGISTRY}, a)
+	pay_tmp, _ := os.join_path({DISK_TEST_DIR, gloaming.DISK_TMP_PAYLOADS}, a)
+	journal, _ := os.join_path({DISK_TEST_DIR, gloaming.DISK_JOURNAL}, a)
+
+	dict := u64(0xBEEF)
+	text, toks, segs := disk_test_doc(a)
+	store, ds, serr := gloaming.store_disk(DISK_TEST_DIR, payload_test_resolver,
+		nil, dict, 0, a)
+	if !testing.expectf(t, serr == .None, "open: %v", serr) { return }
+	if aerr := store.add_document(store.ctx, 1, text, toks, segs); aerr != .None {
+		testing.expectf(t, false, "add: %v", aerr)
+		return
+	}
+	doc2 := make([]gloaming.Token, 1, a)
+	doc2[0] = toks[1]
+	doc2[0].start = 0
+	doc2[0].end = 3
+	if aerr := store.add_document(store.ctx, 2, "が", doc2, nil); aerr != .None {
+		testing.expectf(t, false, "add 2: %v", aerr)
+		return
+	}
+	testing.expect_value(t, int(gloaming.disk_store_close(ds)),
+		int(gloaming.Store_Err.None))
+	reg_old, rerr := os.read_entire_file_from_path(reg_path, a)
+	if !testing.expectf(t, rerr == nil, "read registry: %v", rerr) { return }
+	pay_old, perr := os.read_entire_file_from_path(pay_path, a)
+	if !testing.expectf(t, perr == nil, "read payloads: %v", perr) { return }
+
+	// a real compaction produces the new bytes; both documents stay
+	// live here — the registry's dropped history is what differs
+	store2, ds2, serr2 := gloaming.store_disk(DISK_TEST_DIR, payload_test_resolver,
+		nil, dict, 0, a)
+	if !testing.expectf(t, serr2 == .None, "open 2: %v", serr2) { return }
+	if cerr := gloaming.disk_store_compact(ds2); cerr != .None {
+		testing.expectf(t, false, "compact: %v", cerr)
+		return
+	}
+	testing.expect_value(t, int(gloaming.disk_store_close(ds2)),
+		int(gloaming.Store_Err.None))
+	reg_new, rerr2 := os.read_entire_file_from_path(reg_path, a)
+	if !testing.expectf(t, rerr2 == nil, "read new registry: %v", rerr2) { return }
+	pay_new, perr2 := os.read_entire_file_from_path(pay_path, a)
+	if !testing.expectf(t, perr2 == nil, "read new payloads: %v", perr2) { return }
+	testing.expect(t, len(reg_new) < len(reg_old), "compacted registry must be smaller")
+
+	jb := make([]u8, 8, a)
+	copy(jb[0:4], gloaming.COMPACT_JOURNAL_MAGIC)
+	gloaming.pl_put_u32(jb, 4, gloaming.COMPACT_JOURNAL_VERSION)
+
+	// one open-and-check per crash window (file-scope helper — local
+	// procs cannot capture)
+
+	// (a) stray tmps, no journal — the old state is restored, the tmps
+	// are discarded
+	_ = os.write_entire_file_from_bytes(reg_path, reg_old)
+	_ = os.write_entire_file_from_bytes(pay_path, pay_old)
+	_ = os.write_entire_file_from_bytes(reg_tmp, reg_new)
+	_ = os.write_entire_file_from_bytes(pay_tmp, pay_new)
+	compact_crash_open(t, dict, toks, a, reg_tmp, pay_tmp, journal, false, len(reg_old), len(pay_old), "pre-journal")
+
+	// (b) journal + both tmps — the swap completes at open
+	_ = os.write_entire_file_from_bytes(reg_path, reg_old)
+	_ = os.write_entire_file_from_bytes(pay_path, pay_old)
+	_ = os.write_entire_file_from_bytes(reg_tmp, reg_new)
+	_ = os.write_entire_file_from_bytes(pay_tmp, pay_new)
+	_ = os.write_entire_file_from_bytes(journal, jb)
+	compact_crash_open(t, dict, toks, a, reg_tmp, pay_tmp, journal, true, len(reg_new), len(pay_new), "journal-both-tmps")
+
+	// (c) journal + payloads renamed, registry not — recovery finishes it
+	_ = os.write_entire_file_from_bytes(reg_path, reg_old)
+	_ = os.write_entire_file_from_bytes(pay_path, pay_new)
+	_ = os.write_entire_file_from_bytes(reg_tmp, reg_new)
+	_ = os.write_entire_file_from_bytes(journal, jb)
+	compact_crash_open(t, dict, toks, a, reg_tmp, pay_tmp, journal, true, len(reg_new), len(pay_new), "payloads-renamed")
+
+	// (d) journal + registry renamed, payloads not — recovery finishes it
+	_ = os.write_entire_file_from_bytes(reg_path, reg_new)
+	_ = os.write_entire_file_from_bytes(pay_path, pay_old)
+	_ = os.write_entire_file_from_bytes(pay_tmp, pay_new)
+	_ = os.write_entire_file_from_bytes(journal, jb)
+	compact_crash_open(t, dict, toks, a, reg_tmp, pay_tmp, journal, true, len(reg_new), len(pay_new), "registry-renamed")
 }
 
 // Association measures: the measure family over one co_occurrence
@@ -4971,6 +5493,21 @@ assoc_variants_contract :: proc(t: ^testing.T) {
 	testing.expectf(t, oeerr == gloaming.Freq_Err.None, "oe: %v", oeerr)
 	if !testing.expectf(t, oc[1] == 1 && oe[1] == 2,
 		"one zero row: %f %f", oc[1], oe[1]) { return }
+
+	// parallel integer rows round the cosine a hair under zero
+	// (measured −2.2e-16) — the kernel clamps to the mathematical 0,
+	// because unclamped the table fails dist_matrix_ok and every
+	// linkage over it refuses
+	pw := make([]f64, 4, a) // rows [1,5] and [2,10]
+	pw[0 * 2 + 0], pw[0 * 2 + 1] = 1, 5
+	pw[1 * 2 + 0], pw[1 * 2 + 1] = 2, 10
+	pc, pcerr := gloaming.weight_distance(pw, 2, .Cosine, a)
+	testing.expectf(t, pcerr == gloaming.Freq_Err.None, "parallel cosine: %v", pcerr)
+	if !testing.expectf(t, pc[1] == 0, "parallel rows must clamp to 0: %f", pc[1]) {
+		return
+	}
+	_, plerr := gloaming.linkage_merges(pc, 2, .Ward, a)
+	testing.expect_value(t, int(plerr), int(gloaming.Freq_Err.None))
 
 	// refusals: wrong length, negative, non-finite
 	_, err = gloaming.weight_distance(w, 4, .Euclid, a)
