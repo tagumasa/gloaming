@@ -1325,7 +1325,7 @@ of query_parse (ids and memo geometry assigned); cursors on one Query
 may run concurrently.
 */
 match_begin :: proc(q: ^Query, stream: Token_Stream,
-                    a := context.allocator) -> Match_Cursor {
+                    a: mem.Allocator) -> Match_Cursor {
 	n := len(stream.tokens)
 	total := q.n_ids * (n + 1) * q.owed_dim
 	words := (total + 31) / 32
@@ -1758,7 +1758,7 @@ return with cursor.err != .None means the run aborted (Interrupted via
 the stop-check, or Work_Capped by the budget); otherwise it is simply
 the end of the stream.
 */
-next_match :: proc(c: ^Match_Cursor, a := context.allocator) -> (Match, bool) {
+next_match :: proc(c: ^Match_Cursor, a: mem.Allocator) -> (Match, bool) {
 	if c.ended { return {}, false }
 	n := len(c.stream.tokens)
 

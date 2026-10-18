@@ -20,7 +20,10 @@ import "core:hash"
 import "core:mem"
 
 RECLOG_MAGIC :: "GLR1"
-RECLOG_VERSION :: 2 // 2 = the curation kinds; readers take 1..2
+// 3 = a tombstone at id == len appends a dead row (only the
+// compaction writer emits that form); readers take 1..3 — a v1/v2
+// log never contains it, so older files read unchanged
+RECLOG_VERSION :: 3
 RECLOG_HEADER_SIZE :: 8
 REC_FRAME_FIXED    :: 13 // kind u8 + len u32 + check u64
 REC_SEG_SIZE       :: 12 // kind u8 + pad[3] + start u32 + end u32
@@ -450,12 +453,12 @@ rec_apply :: proc(docs: ^map[Doc_Id]Rec_Doc, graph: ^Doc_Graph,
 		case .Entity:
 			row, kind_s, ok := rec_parse_entity(r.body)
 			if !ok { return .Malformed }
+			// id must name an existing row or the next slot; a
+			// tombstone at id == len appends a dead row — how a
+			// compaction rewrite preserves a dead slot without
+			// renumbering (row ids are dense and never reused)
 			if int(row.id) > len(graph.entities) { return .Malformed }
-			if !row.live {
-				// a tombstone targets an existing row — it is an undo,
-				// not a way to mint dead rows
-				if int(row.id) >= len(graph.entities) { return .Malformed }
-			} else {
+			if row.live {
 				// a live row's names must not collide with another live
 				// entity — the writers' uniqueness, replayed. A name
 				// held by an entity this same batch tombstones LATER is
@@ -483,10 +486,9 @@ rec_apply :: proc(docs: ^map[Doc_Id]Rec_Doc, graph: ^Doc_Graph,
 		case .Relation:
 			row, kind_s, ok := rec_parse_relation(r.body)
 			if !ok { return .Malformed }
+			// the entity rule: id must name an existing row or the
+			// next slot; a tombstone at id == len appends a dead row
 			if int(row.id) > len(graph.relations) { return .Malformed }
-			if !row.live {
-				if int(row.id) >= len(graph.relations) { return .Malformed }
-			}
 			if row.live {
 				if !graph_entity_live(graph, row.from) ||
 				   !graph_entity_live(graph, row.to) { return .Malformed }

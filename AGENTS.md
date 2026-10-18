@@ -161,10 +161,16 @@ just corpus-ja      # stage the JP bench corpus from 青空文庫 (network)
 
 These are settled structural rules. Violations get flagged in review.
 
-- **The library body is `core:*` only.** No `os`/`thread` on analysis
-  paths; `core:os` is confined to `store_disk` (the disk backend behind
-  the store port). A new os/thread need in the body means the design
-  boundary moved — take it to the specification first.
+- **The library body is `core:*` plus `base:intrinsics`.** `core:thread`
+  is a core package and serves the library's fork-join fan-outs alone
+  — the corpus passes over stores and the dense-matrix row splits (a
+  fork-join inside the call: the caller is worker 0, no thread
+  outlives the call, outputs byte-identical at every width); the
+  intrinsics serve the fan-out's claim counter. Single-document
+  analysis paths stay single-threaded. `core:os` is confined to
+  `store_disk` (the disk backend behind the store port). Any other
+  os/thread need in the body means the design boundary moved — take
+  it to the specification first.
 - **No FFI anywhere in this repository.** No `foreign` declarations, no
   vendored C, nothing that makes the build need a C toolchain.
   Pure-Odin external packages are fine (the moli adapter is the
@@ -192,10 +198,23 @@ These are settled structural rules. Violations get flagged in review.
   bytes — a caller-owned key rots once the caller's memory dies, and
   later lookups miss silently. No process globals; state is passed
   explicitly.
-- **Concurrency: the library never locks.** Exclusion is the host's,
-  type by type: a parsed `Query` (and `Lemma_Groups`) is immutable and
-  serves concurrent cursors; the store and `Doc_Graph` are single-writer
-  under host-side exclusion; stats and glexport are call-scoped.
+- **Concurrency: single writer, parallel reads — the library never
+  locks.** Exclusion is the host's, type by type: a parsed `Query`
+  (and `Lemma_Groups`) is immutable and serves concurrent
+  cursors/lookups; store reads (either backend, cache on or off)
+  put their results on the caller's `a`, their scratch on the
+  caller's `context.temp_allocator`, and never touch store-owned
+  memory — a cache hit is a map probe over an immutable slot; the
+  store (writes and cache fill/trim via `disk_store_cache_warm`) and
+  `Doc_Graph` are single-writer under host-side exclusion at
+  quiescent points; corpus passes fan out over documents and the
+  dense-matrix passes over rows inside the call (the `workers` dial,
+  default 1) and are byte-identical at every width; stats and
+  glexport are call-scoped. No library path substitutes the ambient
+  allocator for a missing parameter — read APIs take the allocator
+  explicitly; read-path scratch rides the caller's
+  `context.temp_allocator`, so a host spawning its own reader
+  threads pins each worker's context, both allocators.
 - **Memory lifetime is rule-bound (no GC).** Request results live on
   the caller's arena; procedure parameters that take an allocator keep
   the short `a` (or a role name — `arena`, `scratch` — when the role

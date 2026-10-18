@@ -772,8 +772,12 @@ cooc_pair_grow :: proc(t: ^Cooc_Pair_Table, a: mem.Allocator) {
 		t.keys[slot] = k
 		t.counts[slot] = old_counts[i]
 	}
-	delete(old_keys)
-	delete(old_counts)
+	// the old backings are plain slice views — they carry no allocator,
+	// so the free names `a` explicitly (a bare delete would free through
+	// the ambient context, a bad free in any caller whose allocator
+	// differs from it)
+	delete(old_keys, a)
+	delete(old_counts, a)
 }
 
 // one window: distinct keys in first-appearance order (the order is
@@ -1609,8 +1613,51 @@ Weight_Distance :: enum {
 	Cosine,
 }
 
+// one pair's dissimilarity — the kernel the serial loop and the
+// fan-out lanes share, so both widths run the same arithmetic
+weight_pair :: proc(w: []f64, k: int, m: Weight_Distance, norms: []f64,
+                    i, j: int) -> f64 {
+	dij := 0.0
+	switch m {
+	case .Euclid:
+		s := 0.0
+		for b in 0..<k {
+			diff := w[i * k + b] - w[j * k + b]
+			s += diff * diff
+		}
+		dij = math.sqrt(s)
+	case .Cosine:
+		if norms[i] == 0 && norms[j] == 0 {
+			dij = 0 // two zero rows are identical
+		} else if norms[i] == 0 || norms[j] == 0 {
+			dij = 1 // a zero row shares no direction
+		} else {
+			dot := 0.0
+			for b in 0..<k { dot += w[i * k + b] * w[j * k + b] }
+			dij = 1 - dot / (norms[i] * norms[j])
+			// parallel rows round a hair UNDER zero (measured −2.2e-16
+			// on integer-parallel vectors) — the mathematical value is
+			// 0, and unclamped it is a negative entry dist_matrix_ok
+			// refuses, so the whole cosine→linkage path rejects a
+			// table this kernel itself produced
+			if dij < 0 { dij = 0 }
+		}
+	}
+	return dij
+}
+
+/*
+The distance is O(k³) over a caller-chosen dimension — a pure
+transform, so no stop-check (the stats matrix rule). The trailing
+`workers` dial row-splits the pair loop: lanes claim rows off the
+shared counter and write both triangle cells of each pair they own
+(no pair is written twice, no lane shares a cell), so the output is
+bit-identical at every width. `workers <= 1` runs the serial loop
+unchanged.
+*/
 weight_distance :: proc(w: []f64, k: int, m: Weight_Distance,
-                        a: mem.Allocator) -> ([]f64, Freq_Err) {
+                        a: mem.Allocator,
+                        workers: int = 1) -> ([]f64, Freq_Err) {
 	if k < 0 || len(w) != k * k { return {}, .Bad_Count }
 	for v in w {
 		// NaN and Inf poison norms and dots — the finiteness gate
@@ -1625,29 +1672,14 @@ weight_distance :: proc(w: []f64, k: int, m: Weight_Distance,
 		norms[i] = math.sqrt(s)
 	}
 	d := make([]f64, k * k, a)
+	if fanout_units(workers, k) > 1 {
+		dist_fanout(w, k, m, norms[:], d[:], a, workers)
+		return d, .None
+	}
 	for i in 0..<k {
 		d[i * k + i] = 0
 		for j in i + 1..<k {
-			dij := 0.0
-			switch m {
-			case .Euclid:
-				s := 0.0
-				for b in 0..<k {
-					diff := w[i * k + b] - w[j * k + b]
-					s += diff * diff
-				}
-				dij = math.sqrt(s)
-			case .Cosine:
-				if norms[i] == 0 && norms[j] == 0 {
-					dij = 0 // two zero rows are identical
-				} else if norms[i] == 0 || norms[j] == 0 {
-					dij = 1 // a zero row shares no direction
-				} else {
-					dot := 0.0
-					for b in 0..<k { dot += w[i * k + b] * w[j * k + b] }
-					dij = 1 - dot / (norms[i] * norms[j])
-				}
-			}
+			dij := weight_pair(w, k, m, norms[:], i, j)
 			d[i * k + j] = dij
 			d[j * k + i] = dij
 		}
@@ -1677,7 +1709,13 @@ as is a wrong length.
 Heights are non-decreasing in exact arithmetic; at f64 a tie can dip
 by an ulp (measured −1.4e-17 on the novel bench) — hosts drawing
 dendrograms may clamp. The optional stop-check polls once per row in
-the initial heap build and once per merge step.
+the initial heap build and once per merge step. The pass stays
+serial at any width by measurement: the merge loop is irreducibly
+sequential (each step reads the cluster the previous one created),
+and the initial build the fan would split is a single-digit share
+of the phase — a width-4 split of it measured within noise of the
+serial run on the bench corpus (docs/benchmarks.md, the k×k matrix
+rows), so there is no `workers` dial to not pay for.
 */
 
 Ward_Merge :: struct {
@@ -1772,6 +1810,21 @@ ward_push :: proc(h: ^[dynamic]Ward_Heap_Ent, e: Ward_Heap_Ent) {
 	}
 }
 
+// sift-down from `from` — the heap repair ward_pop_live's lazy
+// deletion runs on the replacement root
+ward_sift :: proc(h: ^[dynamic]Ward_Heap_Ent, from: int) {
+	i := from
+	for {
+		l, r := 2 * i + 1, 2 * i + 2
+		s := i
+		if l < len(h^) && ward_less(&h^[l], &h^[s]) { s = l }
+		if r < len(h^) && ward_less(&h^[r], &h^[s]) { s = r }
+		if s == i { break }
+		h^[i], h^[s] = h^[s], h^[i]
+		i = s
+	}
+}
+
 // pop past entries whose clusters a later merge already absorbed
 ward_pop_live :: proc(h: ^[dynamic]Ward_Heap_Ent,
                       alive: []bool) -> (Ward_Heap_Ent, bool) {
@@ -1780,16 +1833,7 @@ ward_pop_live :: proc(h: ^[dynamic]Ward_Heap_Ent,
 		last := pop(h)
 		if len(h^) > 0 {
 			h^[0] = last
-			i := 0
-			for {
-				l, r := 2 * i + 1, 2 * i + 2
-				s := i
-				if l < len(h^) && ward_less(&h^[l], &h^[s]) { s = l }
-				if r < len(h^) && ward_less(&h^[r], &h^[s]) { s = r }
-				if s == i { break }
-				h^[i], h^[s] = h^[s], h^[i]
-				i = s
-			}
+			ward_sift(h, 0)
 		}
 		if alive[e.i] && alive[e.j] { return e, true }
 	}
@@ -1824,7 +1868,8 @@ operate on dissimilarities directly: the Lance–Williams α_i =
 n_i/(n_i+n_j) forms with no squaring, the merge height the raw
 dissimilarity at which the pair met. Both are monotone, so heights
 stay non-decreasing up to the same ulp caveat as Ward's. Cluster ids
-follow ward_merges: leaves 0..n−1, merge s is n+s.
+follow ward_merges: leaves 0..n−1, merge s is n+s. Like ward_merges,
+serial at any width by the same measurement.
 */
 Linkage :: enum {
 	Ward,
@@ -2007,7 +2052,25 @@ recommended 1e-12 / 256: iteration
 stops at whichever bound bites first. Weights must be non-negative
 and finite — anything else is Bad_Count, as is a wrong length or
 budget. The optional stop-check polls once per axis iteration.
+
+The trailing `workers` dial row-splits every axis iteration's
+matvec: lanes claim rows off the shared counter and write only their
+own buf rows in the same j order, so the iterates are bit-identical
+at every width (the fork-join is per iteration, threads never
+outliving one matvec). The dial engages only above POWER_FAN_MIN_M
+active keys — the per-iteration spawn cost multiplies by the
+iteration count, and below that row count it exceeds the matvec it
+parallelizes; below the floor (or at workers <= 1) the serial body
+runs unchanged.
 */
+
+// the coords matvec's fan-out floor: with one fork-join per axis
+// iteration, spawn overhead rides up to max_iter times, so the wide
+// path engages only well above the dial's default networks. The
+// bench brackets the choice (docs/benchmarks.md, the k×k matrix
+// rows): at 1,024 keys the fan pays about 1.9×, while the default
+// top-60 networks sit two orders below the floor
+POWER_FAN_MIN_M :: 512
 
 Coord :: struct {
 	x: f64,
@@ -2017,7 +2080,8 @@ Coord :: struct {
 power_coords :: proc(w: []f64, k: int, tol: f64, max_iter: int,
                      a: mem.Allocator,
                      check: proc(user: rawptr) -> bool = nil,
-                     user: rawptr = nil) -> ([]Coord, Freq_Err) {
+                     user: rawptr = nil,
+                     workers: int = 1) -> ([]Coord, Freq_Err) {
 	if k < 0 || len(w) != k * k { return {}, .Bad_Count }
 	if tol <= 0 || max_iter < 1 { return {}, .Bad_Budget }
 	for i in 0..<k * k {
@@ -2067,10 +2131,14 @@ power_coords :: proc(w: []f64, k: int, tol: f64, max_iter: int,
 	defer delete(v2)
 	orth1 := [1][]f64{mass[:]}
 	orth2 := [2][]f64{mass[:], v1[:]}
-	if !power_axis(sm[:], m, orth1[:], tol, max_iter, buf[:], v1[:], check, user) {
+	lanes := 1
+	if workers > 1 && m >= POWER_FAN_MIN_M { lanes = workers }
+	if !power_axis(sm[:], m, orth1[:], tol, max_iter, buf[:], v1[:], a, lanes,
+			check, user) {
 		return {}, .Interrupted
 	}
-	if !power_axis(sm[:], m, orth2[:], tol, max_iter, buf[:], v2[:], check, user) {
+	if !power_axis(sm[:], m, orth2[:], tol, max_iter, buf[:], v2[:], a, lanes,
+			check, user) {
 		return {}, .Interrupted
 	}
 	l1 := power_rayleigh(sm[:], m, v1[:])
@@ -2093,10 +2161,13 @@ power_coords :: proc(w: []f64, k: int, tol: f64, max_iter: int,
 // and iterates are sign-aligned against the previous step — an
 // iterate that flipped sign is the same axis, so a negative dominant
 // eigenvalue converges instead of oscillating. `buf` is scratch both
-// axes share. Returns false the moment the stop-check fires — `x` is
-// partial then, and the caller returns .Interrupted.
+// axes share. Each iteration's matvec runs through matvec_fanout —
+// at `lanes` <= 1 that is the serial loop unchanged. Returns false
+// the moment the stop-check fires — `x` is partial then, and the
+// caller returns .Interrupted.
 power_axis :: proc(sm: []f64, m: int, orth: [][]f64, tol: f64,
                    max_iter: int, buf: []f64, x: []f64,
+                   a: mem.Allocator, lanes: int,
                    check: proc(user: rawptr) -> bool, user: rawptr) -> bool {
 	if len(orth) == 0 {
 		inv := 1.0 / math.sqrt(f64(m))
@@ -2121,11 +2192,7 @@ power_axis :: proc(sm: []f64, m: int, orth: [][]f64, tol: f64,
 	}
 	for _ in 0..<max_iter {
 		if check != nil && check(user) { return false }
-		for i in 0..<m {
-			sv := 0.0
-			for j in 0..<m { sv += sm[i * m + j] * x[j] }
-			buf[i] = sv
-		}
+		matvec_fanout(sm, m, x, buf, a, lanes)
 		// the image of a unit iterate collapsing onto the deflated
 		// span is the degenerate case (a zero eigenvalue): the axis
 		// carries nothing, and the honest answer is the zero axis —

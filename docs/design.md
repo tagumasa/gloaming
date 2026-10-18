@@ -27,9 +27,15 @@ host application — whatever embeds gloaming; the first host is the
 
 Rules:
 
-- gloaming core is pure foundation: `core:*` only; no `os`/`thread` on
-  analysis paths. Disk backends are host-selected behind port procedures
-  (`core:os` appears in store_disk and nowhere else).
+- gloaming core is pure foundation: `core:*` plus `base:intrinsics`.
+  `core:thread` is a core package and serves the library's fork-join
+  fan-outs alone — the corpus passes over stores and the dense-matrix
+  row splits: a fork-join inside the call — the caller is worker 0,
+  no thread outlives the call, and outputs are byte-identical at
+  every width; the intrinsics serve the fan-out's claim counter.
+  Single-document analysis paths stay single-threaded. Disk backends
+  are host-selected behind port procedures (`core:os` appears in
+  store_disk and nowhere else).
 - No FFI anywhere in this repository: no `foreign` declarations, no C
   sources (vendored or linked), nothing that makes the build need a C
   toolchain. Pure-Odin external packages are fine — the moli adapter is
@@ -314,6 +320,40 @@ derived); evidence absorbs as a set — a span the row already holds is
 not repeated, so re-running a rule or re-citing a passage is
 idempotent.
 
+Compaction (`disk_store_compact`, host-invoked at a quiescent point)
+rewrites the store to its current state: one registry batch — live
+documents with their payloads re-copied dense (orphans reclaimed),
+live curation rows, dead entity/relation rows written as tombstones
+so row ids stay dense and stable, current attrs — scanned and compared
+against the in-memory state before anything commits. The landing is a
+crash-safe two-file swap (payloads tmp, registry tmp, journal, two
+renames): before the journal the old files are intact; after it,
+reopen completes the renames idempotently — every crash point reopens
+to exactly one whole state, never a mixed pair. RECLOG is version 3
+(readers take 1..3; the v3 addition is exactly the appended dead row,
+a form no older writer emits, so older logs read unchanged).
+Kind ids may renumber to ascending-first-seen order across a
+compaction — Kind_Id is internal and every API reads kind strings, so
+the observable state is unchanged.
+
+The L3 tier is `Bounded_Cache` (cache.odin): a byte-budget cache over
+decoded token payloads, enabled by the store_disk `cache_max_bytes`
+dial (0 = off, the default). Slots are immutable once published: a
+hit is a map probe plus one struct-array copy onto the caller's arena
+(the port's materializing clause — every string the tokens view is
+store-owned), and a read never mutates the cache — which is what
+makes concurrent reads safe. Fill and eviction belong to
+`disk_store_cache_warm`, a quiescent-point host call under the
+store's single-writer exclusion (the compact lane): it publishes one
+slot per uncached document — idempotent; a document larger than the
+whole budget is skipped — and evicts oldest-first in insertion order,
+the deterministic order, until the budget holds. Removal drops the
+slot. The budget's measured contract: a cache pays only over a hot
+set — one lump covering the documents the host re-reads, never a
+per-document slice; a budget below the hot set thrashes and is slower
+than no cache. Whole-corpus passes decode each document once and get
+nothing from it, by design.
+
 ## API discipline
 
 - Cursor streaming everywhere; a request's matches live on its arena and
@@ -343,11 +383,29 @@ idempotent.
   convenience, not a leak requirement. The strings a parsed `Query`
   holds live in one pool block the result carries.
 - No process globals; state is passed explicitly.
-- Concurrency: the library never locks — exclusion is the host's, type
-  by type. A parsed `Query` (and `Lemma_Groups`) is immutable and
-  serves concurrent cursors/lookups; the store and `Doc_Graph` are
-  single-writer under host-side exclusion; stats and glexport are
-  call-scoped.
+- Concurrency: single writer, parallel reads — the library never
+  locks; exclusion is the host's, type by type.
+
+  | Call family | Concurrency lane |
+  |---|---|
+  | `Query` + `Lemma_Groups` (parsed) | Immutable. Concurrent cursors/lookups on one shared value; each cursor owns its state on its caller's `a`. |
+  | Store reads — `docs`/`has`/`tokens`/`segments`, either backend, cache on or off | Concurrent on a shared store. Results allocate on the caller's `a`; reads never touch store-owned memory, and their scratch rides the caller's `context.temp_allocator` (the rule under the table); a cache hit is a map probe over an immutable slot. |
+  | Store writes (`add`/`remove`/`compact`) and cache fill/trim (`disk_store_cache_warm`) | Single writer under host-side exclusion, quiescent-point calls. A write concurrent with a read is outside the contract. |
+  | Corpus passes (`corpus_freq` and kin, the co-occurrence accumulator) | A fork-join fan-out over documents inside the call — the `workers` dial, default 1; byte-identical at every width, no thread outlives the call. |
+  | Dense-matrix passes (`weight_distance`, `power_coords`) | The same fork-join over matrix rows. `weight_distance` splits the O(k³) pair loop — lanes write both triangle cells of the pairs they own, disjoint by construction. `power_coords` splits each axis iteration's matvec and engages only above `POWER_FAN_MIN_M` active keys, where the per-iteration fork-join pays for itself. Both are bit-identical at every width. `linkage_merges`/`ward_merges` and `pagerank_links` stay serial by measurement: the linkage merge loop is irreducibly sequential (each step reads the cluster the previous one created) with a fan-shaped initial build that is a single-digit share of the phase, and pagerank's iteration is an O(links) scatter whose standing bench rows sit under a millisecond. |
+  | `Doc_Graph` | Single writer under host-side exclusion; the index maps are read-only after the open-replay rebuild, so reads ride the store-read lanes. |
+  | stats / corpus tables / KWIC / glexport | Call-scoped; per-call state on the caller's `a`. |
+
+  No library path substitutes the ambient allocator for a missing
+  parameter: read APIs take the allocator explicitly, and results live
+  on the caller's `a` or borrow store-owned bytes. Read-path scratch
+  does ride the caller's `context.temp_allocator` — the payload
+  inflater's buffer (core's inflater preallocates at least a MiB
+  whatever the real size, which must never land on the caller's
+  result arena) and the fuzzy matcher's DP rows — so a host spawning
+  its own reader threads pins each worker's context, both allocators,
+  to worker-owned storage; the library's fan-out lanes and the
+  concurrency tests follow that discipline.
 
 ## Workflow coverage
 

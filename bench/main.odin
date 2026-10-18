@@ -329,7 +329,7 @@ Disk_Add_Ctx :: struct {
 
 disk_add_cb :: proc(user: rawptr) {
 	ctx := cast(^Disk_Add_Ctx)user
-	dir := fmt.aprintf("%s/rep%d", DISK_ROOT, ctx.i, context.temp_allocator)
+	dir := fmt.aprintf("%s/rep%d", DISK_ROOT, ctx.i, allocator = context.temp_allocator)
 	if !os.exists(DISK_ROOT) { _ = os.mkdir(DISK_ROOT) }
 	if !os.exists(dir) { _ = os.mkdir(dir) }
 	reg, _ := os.join_path({dir, "registry.glr"}, context.temp_allocator)
@@ -372,6 +372,109 @@ disk_decode_cb :: proc(user: rawptr) {
 		context.temp_allocator)
 	if terr != gl.Store_Err.None { fault("disk tokens", terr); return }
 	delete(toks, context.temp_allocator)
+}
+
+Disk_Compact_Ctx :: struct {
+	ds:         ^gl.Disk_Store,
+	before_reg: i64,
+	before_pay: i64,
+	after_reg:  i64,
+	after_pay:  i64,
+}
+
+disk_compact_cb :: proc(user: rawptr) {
+	ctx := cast(^Disk_Compact_Ctx)user
+	if cerr := gl.disk_store_compact(ctx.ds); cerr != gl.Store_Err.None {
+		fault("disk_store_compact", cerr)
+		return
+	}
+	ctx.after_reg = ctx.ds.log_end
+	ctx.after_pay = ctx.ds.pay_end
+}
+
+Fanout_Stage_Ctx :: struct {
+	store:   gl.Store,
+	docs:    []gl.Doc_Id,
+	workers: int,
+	cooc:    bool, // false = corpus_freq, true = corpus_cooc
+	rows:    int, // freq rows / cooc pairs — the identity across widths
+}
+
+fanout_stage_cb :: proc(user: rawptr) {
+	ctx := cast(^Fanout_Stage_Ctx)user
+	if ctx.cooc {
+		pairs, _, err := gl.corpus_cooc(ctx.store, ctx.docs,
+			{unit = .Segments, max_pairs = 20000,
+				filter = {pos_prefixes = {"名詞,"}, use_lemma = true}},
+			context.temp_allocator, nil, nil, ctx.workers)
+		if err != gl.Store_Err.None { fault("corpus_cooc", err); return }
+		ctx.rows = len(pairs)
+		return
+	}
+	entries, err := gl.corpus_freq(ctx.store, ctx.docs,
+		{pos_prefixes = {"名詞,"}, use_lemma = true},
+		context.temp_allocator, nil, nil, ctx.workers)
+	if err != gl.Store_Err.None { fault("corpus_freq", err); return }
+	ctx.rows = len(entries)
+}
+
+// --- [gloaming] k×k matrix ---
+
+// one of the cluster/coords tail's three phases over a retained
+// weight or distance table; each rep's output dies inside the cb
+Matrix_Stage_Ctx :: struct {
+	w:       []f64,
+	dist:    []f64,
+	k:       int,
+	iter:    int, // coords' max_iter
+	workers: int,
+	phase:   int, // 0 weight_distance, 1 linkage_merges, 2 power_coords
+	rows:    int, // last rep's output rows — the identity across widths
+}
+
+matrix_stage_cb :: proc(user: rawptr) {
+	ctx := cast(^Matrix_Stage_Ctx)user
+	switch ctx.phase {
+	case 0:
+		d, err := gl.weight_distance(ctx.w, ctx.k, .Cosine,
+			context.allocator, ctx.workers)
+		if err != .None { fault("weight_distance", err); return }
+		ctx.rows = len(d)
+		if len(d) > 0 { mem.free(raw_data(d), context.allocator) }
+	case 1:
+		merges, err := gl.linkage_merges(ctx.dist, ctx.k, .Ward, context.allocator)
+		if err != .None { fault("linkage_merges", err); return }
+		ctx.rows = len(merges)
+		if len(merges) > 0 { mem.free(raw_data(merges), context.allocator) }
+	case 2:
+		coords, err := gl.power_coords(ctx.w, ctx.k, 1e-12, ctx.iter,
+			context.allocator, nil, nil, ctx.workers)
+		if err != .None { fault("power_coords", err); return }
+		ctx.rows = len(coords)
+		if len(coords) > 0 { mem.free(raw_data(coords), context.allocator) }
+	}
+}
+
+bench_str_less :: proc(x, y: ^string) -> bool { return x^ < y^ }
+
+// the distinct keys of a pair slice, sorted — network_keys' shape (a
+// CLI proc, replicated here so the bench rides the library alone).
+// Returns the dynamic (it carries its allocator; a returned view
+// would not, and its bare delete would free through the ambient one)
+bench_network_keys :: proc(pairs: []gl.Co_Pair, a: mem.Allocator) -> [dynamic]string {
+	kset := make(map[string]bool, a)
+	keys: [dynamic]string = make([dynamic]string, 0, 2 * len(pairs), a)
+	for p in pairs {
+		sides := [2]string{p.a, p.b}
+		for k in sides {
+			if _, dup := kset[k]; dup { continue }
+			kset[k] = true
+			append(&keys, k)
+		}
+	}
+	delete(kset)
+	gl.sort_with_buffer(keys[:], bench_str_less, a)
+	return keys
 }
 
 // --- [gloaming] graph ---
@@ -1099,8 +1202,14 @@ main :: proc() {
 			fmt.aprintf("registry %d KB + payloads %d KB",
 				dac.reg_bytes / 1024, dac.pay_bytes / 1024))
 	}
-	keep := fmt.aprintf("%s/keep", DISK_ROOT, context.temp_allocator)
+	keep := fmt.aprintf("%s/keep", DISK_ROOT, allocator = context.temp_allocator)
 	if !os.exists(keep) { _ = os.mkdir(keep) }
+	// a fresh keep per run — repopulating an existing store would
+	// answer Duplicate, so the old files go first (disk_add_cb's rule)
+	kr, _ := os.join_path({keep, "registry.glr"}, context.temp_allocator)
+	kp, _ := os.join_path({keep, "payloads.glb"}, context.temp_allocator)
+	_ = os.remove(kr)
+	_ = os.remove(kp)
 	// populate once (untimed): the reopen/decode stages need a store
 	// that actually holds the novel
 	pk_store, pk_ds, pkerr := gl.store_disk(keep, ma.payload_resolver, &an, dv, 0,
@@ -1125,6 +1234,71 @@ main :: proc() {
 	gl.disk_store_close(dec_ds)
 	row("gloaming", "disk tokens (decode)", 3, t,
 		fmt.aprintf("%d tokens", len(toks)))
+
+	// the bounded-cache row: one open, one untimed warm, then timed
+	// reads on the hit path, against the decode row above (budget:
+	// one lump over the novel's payload)
+	ca_store, ca_ds, caerr := gl.store_disk(keep, ma.payload_resolver, &an, dv, 0,
+		context.allocator, cache_max_bytes = 64 << 20)
+	if caerr != gl.Store_Err.None { fault("store_disk cache", caerr); return }
+	ca_warm := []gl.Doc_Id{gl.Doc_Id(0)}
+	if werr := gl.disk_store_cache_warm(ca_ds, ca_warm); werr != gl.Store_Err.None {
+		fault("cache warm", werr)
+		return
+	}
+	ca := Disk_Decode_Ctx{store = ca_store}
+	t = run_stage(3, disk_decode_cb, &ca)
+	gl.disk_store_close(ca_ds)
+	row("gloaming", "disk tokens (bounded cache warm)", 3, t,
+		fmt.aprintf("%d tokens", len(toks)))
+
+	// the corpus-pass fan-out rows: the novel as eight documents, the
+	// same pass serial and at width — the printed row/pair counts are
+	// the identity gate (equal at every width)
+	fdir := fmt.aprintf("%s/fanout", DISK_ROOT, allocator = context.temp_allocator)
+	if !os.exists(fdir) { _ = os.mkdir(fdir) }
+	freg, _ := os.join_path({fdir, "registry.glr"}, context.temp_allocator)
+	fpay, _ := os.join_path({fdir, "payloads.glb"}, context.temp_allocator)
+	_ = os.remove(freg)
+	_ = os.remove(fpay)
+	fa_store, fa_ds, faerr := gl.store_disk(fdir, ma.payload_resolver, &an, dv, 0,
+		context.allocator)
+	if faerr != gl.Store_Err.None { fault("store_disk fanout", faerr); return }
+	for i in 0..<8 {
+		if aerr := fa_store.add_document(fa_store.ctx, gl.Doc_Id(i), text, toks[:],
+				segs[:]); aerr != gl.Store_Err.None {
+			fault("fanout add_document", aerr)
+			return
+		}
+	}
+	fdocs := fa_store.docs(fa_store.ctx, context.temp_allocator)
+	widths := [2]int{1, 4}
+	for workers in widths {
+		fc := Fanout_Stage_Ctx{store = fa_store, docs = fdocs, workers = workers}
+		t = run_stage(3, fanout_stage_cb, &fc)
+		row("gloaming", fmt.aprintf("corpus_freq (8 docs, %d workers)", workers), 3, t,
+			fmt.aprintf("%d rows", fc.rows))
+	}
+	for workers in widths {
+		cc := Fanout_Stage_Ctx{store = fa_store, docs = fdocs, workers = workers, cooc = true}
+		t = run_stage(3, fanout_stage_cb, &cc)
+		row("gloaming", fmt.aprintf("corpus_cooc (8 docs, %d workers)", workers), 3, t,
+			fmt.aprintf("%d pairs", cc.rows))
+	}
+	gl.disk_store_close(fa_ds)
+
+	// the compaction row: full-state rewrite and swap on the same store
+	_, co_ds, coerr := gl.store_disk(keep, ma.payload_resolver, &an, dv, 0,
+		context.allocator)
+	if coerr != gl.Store_Err.None { fault("store_disk compact", coerr); return }
+	coc := Disk_Compact_Ctx{
+		ds = co_ds, before_reg = co_ds.log_end, before_pay = co_ds.pay_end,
+	}
+	t = run_stage(1, disk_compact_cb, &coc)
+	gl.disk_store_close(co_ds)
+	row("gloaming", "disk compact", 1, t,
+		fmt.aprintf("registry %d -> %d B, payloads %d -> %d B",
+			coc.before_reg, coc.after_reg, coc.before_pay, coc.after_pay))
 
 	// ---- [gloaming] graph ----
 	hdr("[gloaming] graph — corpus-shaped: top lemmas + co-occurrence edges")
@@ -1164,6 +1338,80 @@ main :: proc() {
 	row("gloaming", "graph_traverse (depth 3)", 3, t,
 		fmt.aprintf("%d visits", gc.n))
 	gl.graph_destroy(&g)
+
+	// ---- [gloaming] k×k matrix — cluster/coords tail (corpus keys) ----
+	// The tail after the (already-fanned) pair pass: the distance
+	// build, the linkage tree, the coords axes. The wide dial needs a
+	// bigger network than the stats row's cap-20000 table holds, so it
+	// builds its own pair table at a higher cap (same filter shape)
+	// and caps the network at 1024 keys — a bench shape, like the
+	// graph stage. The default-dial rows ride the CLI's top-60 pair
+	// slice. Printed key and merge counts are measured, the identity
+	// gate across widths.
+	{
+		wide_pairs, _, wperr := gl.co_occurrence(stream, {},
+			{unit = .Segments, max_pairs = 200000,
+				filter = {pos_prefixes = {"名詞,"}, use_lemma = true}},
+			context.temp_allocator)
+		if wperr != .None { fault("co_occurrence wide", wperr); return }
+		allkeys := bench_network_keys(wide_pairs, context.temp_allocator)
+		defer if len(allkeys) > 0 { delete(allkeys) }
+		wk := min(1024, len(allkeys))
+		wkeys := allkeys[:wk]
+		w, werr := gl.cooc_weights(wide_pairs, wkeys, context.allocator)
+		if werr != .None { fault("cooc_weights wide", werr); return }
+		defer if len(w) > 0 { mem.free(raw_data(w), context.allocator) }
+		dist, derr := gl.weight_distance(w, wk, .Cosine, context.allocator, 1)
+		if derr != .None { fault("weight_distance retained", derr); return }
+		defer if len(dist) > 0 { mem.free(raw_data(dist), context.allocator) }
+
+		for workers in widths {
+			mx := Matrix_Stage_Ctx{w = w, k = wk, iter = 256, workers = workers, phase = 0}
+			t = run_stage(3, matrix_stage_cb, &mx)
+			row("gloaming", fmt.aprintf("weight_distance (cosine, %d keys, %d workers)",
+				wk, workers), 3, t, "")
+		}
+		// ward rides serial: the merge loop is irreducibly sequential
+		// and the initial build a single-digit share of the phase, so
+		// a width-4 split of it measured within noise of serial (the
+		// adopted/rejected record lives in docs/benchmarks.md)
+		{
+			mx := Matrix_Stage_Ctx{dist = dist, k = wk, phase = 1}
+			t = run_stage(3, matrix_stage_cb, &mx)
+			row("gloaming", fmt.aprintf("linkage_merges (ward, %d keys, serial)",
+				wk), 3, t, fmt.aprintf("%d merges", mx.rows))
+		}
+		for workers in widths {
+			mx := Matrix_Stage_Ctx{w = w, k = wk, iter = 256, workers = workers, phase = 2}
+			t = run_stage(3, matrix_stage_cb, &mx)
+			row("gloaming", fmt.aprintf("power_coords (%d keys, tol 1e-12, iter 256, %d workers)",
+				wk, workers), 3, t, fmt.aprintf("%d coords", mx.rows))
+		}
+
+		// the default dial: the CLI's top-60 pair slice, serial — the
+		// record that the whole tail sits under a millisecond there
+		def_n := min(60, len(coop))
+		dkeys := bench_network_keys(coop[:def_n], context.temp_allocator)
+		defer if len(dkeys) > 0 { delete(dkeys) }
+		dw, dwerr := gl.cooc_weights(coop[:def_n], dkeys[:], context.allocator)
+		if dwerr != .None { fault("cooc_weights default", dwerr); return }
+		defer if len(dw) > 0 { mem.free(raw_data(dw), context.allocator) }
+		ddist, dderr := gl.weight_distance(dw, len(dkeys), .Cosine, context.allocator)
+		if dderr != .None { fault("weight_distance default", dderr); return }
+		defer if len(ddist) > 0 { mem.free(raw_data(ddist), context.allocator) }
+		mx := Matrix_Stage_Ctx{w = dw, k = len(dkeys), iter = 256, phase = 0}
+		t = run_stage(3, matrix_stage_cb, &mx)
+		row("gloaming", fmt.aprintf("weight_distance (cosine, top-60 dial, %d keys)",
+			len(dkeys)), 3, t, "")
+		mx = Matrix_Stage_Ctx{dist = ddist, k = len(dkeys), phase = 1}
+		t = run_stage(3, matrix_stage_cb, &mx)
+		row("gloaming", fmt.aprintf("linkage_merges (ward, top-60 dial, %d keys)",
+			len(dkeys)), 3, t, fmt.aprintf("%d merges", mx.rows))
+		mx = Matrix_Stage_Ctx{w = dw, k = len(dkeys), iter = 256, phase = 2}
+		t = run_stage(3, matrix_stage_cb, &mx)
+		row("gloaming", fmt.aprintf("power_coords (top-60 dial, %d keys)",
+			len(dkeys)), 3, t, fmt.aprintf("%d coords", mx.rows))
+	}
 	delete(ids)
 	delete(ftab, context.temp_allocator)
 	delete(coop, context.temp_allocator)

@@ -319,7 +319,7 @@ LZ77_State :: struct {
 	prev: [DEFLATE_WINDOW_SIZE]int,
 }
 
-lz77_init :: proc(lz: ^LZ77_State, a := context.allocator) {
+lz77_init :: proc(lz: ^LZ77_State, a: mem.Allocator) {
 	lz.pos = 0
 	for i in 0..<DEFLATE_HASH_SIZE { lz.head[i] = -1 }
 	for i in 0..<DEFLATE_WINDOW_SIZE { lz.prev[i] = -1 }
@@ -411,7 +411,7 @@ CL_Run :: struct {
 	extra_bits: u8,
 }
 
-encode_code_lengths :: proc(lengths: []u8, a := context.allocator) -> ([]CL_Run, int) {
+encode_code_lengths :: proc(lengths: []u8, a: mem.Allocator) -> ([]CL_Run, int) {
 	out := make([dynamic]CL_Run, 0, len(lengths) * 2, a)
 	i := 0
 	for i < len(lengths) {
@@ -471,7 +471,7 @@ that decodes identically. It is clamped below at 1. The shipped default
 lives at payload_compress (DEFLATE_DEFAULT_CHAIN); DEFLATE_MAX_CHAIN
 remains the maximum-effort point.
 */
-deflate_compress :: proc(src: []u8, out: ^[dynamic]u8, a := context.allocator,
+deflate_compress :: proc(src: []u8, out: ^[dynamic]u8, a: mem.Allocator,
                          max_chain := DEFLATE_MAX_CHAIN) -> bool {
 	w: Deflate_Writer
 	deflate_writer_init(&w, out)

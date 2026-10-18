@@ -160,18 +160,18 @@ cmd_keyness :: proc(rest: []string, g: ^Globals) -> int {
 		return analysis_errorf("keyness: the reference population is empty")
 	}
 
-	ttab, terr := gl.corpus_freq(rs.st, target, build_filter(&fs), a)
+	ttab, terr := gl.corpus_freq(rs.st, target, build_filter(&fs), a, nil, nil, g.threads)
 	if terr != .None { return analysis_errorf("corpus_freq (target): %v", terr) }
-	rtab, rerr := gl.corpus_freq(rs.st, ref, build_filter(&fs), a)
+	rtab, rerr := gl.corpus_freq(rs.st, ref, build_filter(&fs), a, nil, nil, g.threads)
 	if rerr != .None { return analysis_errorf("corpus_freq (reference): %v", rerr) }
 
 	tpop, rpop := len(target), len(ref)
 	if basis == .Tokens {
 		// populations stay whole whatever the scored tables filtered,
 		// so --min-count drops rows, not weight
-		tt, tc := token_population(rs.st, target, "target", a)
+		tt, tc := token_population(rs.st, target, "target", a, g.threads)
 		if tc != 0 { return tc }
-		rr, rc := token_population(rs.st, ref, "reference", a)
+		rr, rc := token_population(rs.st, ref, "reference", a, g.threads)
 		if rc != 0 { return rc }
 		tpop, rpop = tt, rr
 	}
